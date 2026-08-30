@@ -60,3 +60,8 @@ This UI version automatically polls async Omni 1.1 Flash jobs after submission. 
 - Direct **Job ID lookup** can reopen a known useapi Flow job and recover completed video media.
 - Newly submitted video job IDs are also copied into the page query string so they survive ordinary Streamlit redeploy/reload in the same browser URL.
 - Improved dark-theme contrast for expander headers, uploader buttons, labels, captions, disabled buttons, cards, and inputs.
+
+
+## R8 fix
+- Fixed Flow async video polling: preserves literal `:` / `@` separators in useapi job IDs so `/jobs/{jobId}` no longer returns HTTP 400 Invalid job ID format.
+- Existing submitted jobs can be recovered from the `flow_jobs` URL parameter or the recovery panel; do not resubmit merely because an older build failed to poll them.

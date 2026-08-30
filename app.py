@@ -359,7 +359,16 @@ def flow_submit_video(token: str, email: str, image_media_id: str, prompt: str) 
 
 
 def flow_get_job(token: str, job_id: str) -> dict:
-    return request_json("GET", f"{FLOW_BASE}/jobs/{quote(job_id, safe='')}", headers=flow_headers(token), timeout=60, retries=1)
+    # Flow job IDs intentionally contain literal separators such as ':' (for
+    # example ...-email:user@example.com-bot:google-flow).  Unlike asset IDs,
+    # useapi's /jobs/{jobId} endpoint validates that textual job-ID format.
+    # Percent-encoding the separators (':' -> '%3A') causes HTTP 400
+    # "Invalid job ID format", so preserve the ID structure in the path.
+    jid = str(job_id or "").strip().strip("\"'")
+    if not jid:
+        raise RuntimeError("Missing Flow job ID.")
+    safe_jid = quote(jid, safe=":@+-._")
+    return request_json("GET", f"{FLOW_BASE}/jobs/{safe_jid}", headers=flow_headers(token), timeout=60, retries=1)
 
 
 def flow_jobs_overview(token: str, options: str = "history") -> dict:
