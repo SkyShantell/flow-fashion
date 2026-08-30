@@ -1,4 +1,5 @@
 import base64
+import csv
 import hashlib
 import html
 import io
@@ -45,6 +46,42 @@ def get_secret(name: str, default: str = "") -> str:
         return str(value or default).strip()
     except Exception:
         return str(os.environ.get(name, default) or default).strip()
+
+
+def get_google_service_account_info() -> dict | None:
+    """Load a Google service-account credential from Streamlit secrets.
+
+    Supports either:
+      GOOGLE_SERVICE_ACCOUNT_JSON = '{...json...}'
+    or the common Streamlit table:
+      [gcp_service_account]
+      type = "service_account"
+      ...
+    """
+    try:
+        raw = st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    except Exception:
+        raw = None
+    if raw:
+        if isinstance(raw, dict):
+            return dict(raw)
+        try:
+            return json.loads(str(raw))
+        except Exception:
+            pass
+    try:
+        raw = st.secrets.get("gcp_service_account")
+        if raw:
+            return dict(raw)
+    except Exception:
+        pass
+    env_raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    if env_raw:
+        try:
+            return json.loads(env_raw)
+        except Exception:
+            pass
+    return None
 
 
 def inject_css():
@@ -914,6 +951,57 @@ def jobs_to_manifest(jobs: list[dict]) -> str:
     return json.dumps(clean, indent=2)
 
 
+def jobs_export_rows(jobs: list[dict]) -> tuple[list[str], list[list[str]]]:
+    """Stable batch export used by CSV and Google Sheets."""
+    headers = [
+        "Product #",
+        "Product name",
+        "Product link",
+        "Product ID",
+        "Try-on focus",
+        "Back design",
+        "Image status",
+        "Approved",
+        "Image URL",
+        "Image media ID",
+        "Video status",
+        "Video URL",
+        "Video media ID",
+        "Video job ID",
+        "Selected reference URLs",
+    ]
+    rows = []
+    for i, job in enumerate(jobs, 1):
+        rows.append([
+            str(i),
+            str(job.get("name") or ""),
+            str(job.get("url") or ""),
+            str(job.get("id") or ""),
+            str(job.get("focus") or ""),
+            "Yes" if job.get("back_design") else "No",
+            _status_label(job.get("image_status")),
+            "Yes" if job.get("approved") else "No",
+            str(job.get("image_url") or ""),
+            str(job.get("image_media_id") or ""),
+            _status_label(job.get("video_status")),
+            str(job.get("video_url") or ""),
+            str(job.get("video_media_id") or ""),
+            str(job.get("video_job_id") or ""),
+            " | ".join(str(x) for x in (job.get("selected_refs") or []) if x),
+        ])
+    return headers, rows
+
+
+def jobs_to_csv(jobs: list[dict]) -> bytes:
+    """Excel/Google-Sheets friendly UTF-8 CSV, including the original product link."""
+    headers, rows = jobs_export_rows(jobs)
+    out = io.StringIO(newline="")
+    writer = csv.writer(out)
+    writer.writerow(headers)
+    writer.writerows(rows)
+    return out.getvalue().encode("utf-8-sig")
+
+
 def build_images_zip(jobs: list[dict]) -> bytes | None:
     out = io.BytesIO()
     added = 0
@@ -923,15 +1011,35 @@ def build_images_zip(jobs: list[dict]) -> bytes | None:
                 continue
             data = None
             if job.get("image_encoded"):
-                try: data = base64.b64decode(job["image_encoded"])
-                except Exception: data = None
+                try:
+                    data = base64.b64decode(job["image_encoded"])
+                except Exception:
+                    data = None
             if not data and job.get("image_url"):
-                try: data = download_url(job["image_url"], 90)[0]
-                except Exception: data = None
+                try:
+                    data = download_url(job["image_url"], 90)[0]
+                except Exception:
+                    data = None
             if data:
                 z.writestr(f"{i:02d}_{safe_name(job.get('name'))}.jpg", data)
                 added += 1
     return out.getvalue() if added else None
+
+
+def download_video_for_job(token: str, job: dict) -> bytes | None:
+    """Fetch a completed MP4 without relying on an expiring signed URL."""
+    media_id = str(job.get("video_media_id") or "").strip()
+    if media_id:
+        data, _ = download_video_raw(token, media_id)
+        if data:
+            return data
+    url = str(job.get("video_url") or "").strip()
+    if url:
+        try:
+            return download_url(url, 180)[0]
+        except Exception:
+            return None
+    return None
 
 
 def build_videos_zip(jobs: list[dict], token: str) -> bytes | None:
@@ -941,11 +1049,88 @@ def build_videos_zip(jobs: list[dict], token: str) -> bytes | None:
         for i, job in enumerate(jobs, 1):
             if job.get("video_status") != "completed":
                 continue
-            data = download_video(token, job)
+            data = download_video_for_job(token, job)
             if data:
                 z.writestr(f"{i:02d}_{safe_name(job.get('name'))}.mp4", data)
                 added += 1
     return out.getvalue() if added else None
+
+
+def build_full_batch_zip(jobs: list[dict], token: str) -> tuple[bytes | None, dict]:
+    """Package CSV + JSON + every completed image/video into one ZIP."""
+    out = io.BytesIO()
+    image_count = 0
+    video_count = 0
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("batch.csv", jobs_to_csv(jobs))
+        z.writestr("manifest.json", jobs_to_manifest(jobs))
+        for i, job in enumerate(jobs, 1):
+            stem = f"{i:02d}_{safe_name(job.get('name'))}"
+            if job.get("image_status") == "completed":
+                data = None
+                if job.get("image_encoded"):
+                    try:
+                        data = base64.b64decode(job["image_encoded"])
+                    except Exception:
+                        data = None
+                if not data and job.get("image_url"):
+                    try:
+                        data = download_url(job["image_url"], 90)[0]
+                    except Exception:
+                        data = None
+                if data:
+                    z.writestr(f"images/{stem}.jpg", data)
+                    image_count += 1
+            if job.get("video_status") == "completed":
+                data = download_video_for_job(token, job)
+                if data:
+                    z.writestr(f"videos/{stem}.mp4", data)
+                    video_count += 1
+    payload = out.getvalue()
+    return (payload if (jobs or image_count or video_count) else None), {"images": image_count, "videos": video_count}
+
+
+def push_jobs_to_google_sheet(jobs: list[dict], spreadsheet_url: str, worksheet_name: str, mode: str = "Replace tab") -> tuple[bool, str]:
+    """Push the current batch to Google Sheets using a service account."""
+    info = get_google_service_account_info()
+    if not info:
+        return False, "Google Sheets is not configured. Add GOOGLE_SERVICE_ACCOUNT_JSON (or [gcp_service_account]) to Streamlit Secrets."
+    try:
+        import gspread
+    except Exception:
+        return False, "Google Sheets dependency is missing. Make sure gspread is in requirements.txt and redeploy."
+
+    sheet_ref = str(spreadsheet_url or "").strip()
+    if not sheet_ref:
+        return False, "Paste a Google Sheet URL first."
+    tab_name = (str(worksheet_name or "Flow Try-On").strip() or "Flow Try-On")[:100]
+    headers, rows = jobs_export_rows(jobs)
+    values = [headers] + rows
+    try:
+        gc = gspread.service_account_from_dict(info)
+        if sheet_ref.startswith("http://") or sheet_ref.startswith("https://"):
+            book = gc.open_by_url(sheet_ref)
+        else:
+            book = gc.open_by_key(sheet_ref)
+        try:
+            ws = book.worksheet(tab_name)
+        except gspread.WorksheetNotFound:
+            ws = book.add_worksheet(title=tab_name, rows=max(100, len(values) + 20), cols=max(20, len(headers) + 2))
+
+        if mode == "Append rows":
+            existing = ws.get_all_values()
+            if not existing:
+                ws.update(range_name="A1", values=[headers])
+            if rows:
+                ws.append_rows(rows, value_input_option="USER_ENTERED", insert_data_option="INSERT_ROWS")
+        else:
+            ws.clear()
+            ws.update(range_name="A1", values=values, value_input_option="USER_ENTERED")
+
+        service_email = str(info.get("client_email") or "service account")
+        return True, f"Pushed {len(rows)} product(s) to '{tab_name}'. Connected as {service_email}."
+    except Exception as exc:
+        return False, f"Google Sheets push failed: {exc}"
 
 
 def avatar_library():
@@ -1135,18 +1320,30 @@ def render_job_result(job: dict, index: int, token: str, email: str, avatar_id: 
                 cache_key = f"video_bytes_{job['id']}"
                 cached_data = st.session_state.get(cache_key)
 
+                # Resolve a playable signed URL once when Results is opened. This is
+                # lightweight (metadata only) and does not download the MP4 bytes.
+                auto_key = f"video_autoresolve_{job['id']}"
+                if not video_url and not cached_data and media_id and not st.session_state.get(auto_key):
+                    st.session_state[auto_key] = True
+                    resolved, _message = resolve_video_url(token, media_id)
+                    if resolved:
+                        video_url = resolved
+                        updated["video_url"] = resolved
+                        job["video_url"] = resolved
+                        st.session_state["jobs"][index] = updated
+
                 if video_url:
                     st.video(video_url)
-                    st.link_button("↗ Open video", video_url, use_container_width=True)
+                    st.link_button("↗ Open / download original MP4", video_url, use_container_width=True)
                 elif cached_data:
                     st.video(cached_data, format="video/mp4")
                 else:
                     st.success("Video generation completed.")
-                    st.caption("The MP4 is ready in Flow. Load it only when you want to preview/download it.")
+                    st.caption("The MP4 exists in Flow. Use Refresh preview or Prepare download below if the signed preview link is still being prepared.")
 
                 a1, a2 = st.columns(2)
                 if a1.button(
-                    "↻ Get playable link",
+                    "↻ Refresh preview",
                     key=f"resolve_vid_{job['id']}",
                     use_container_width=True,
                     disabled=not bool(media_id),
@@ -1161,7 +1358,7 @@ def render_job_result(job: dict, index: int, token: str, email: str, avatar_id: 
                         st.warning(message or "Video link is not ready yet.")
 
                 if a2.button(
-                    "↓ Prepare MP4",
+                    "↓ Prepare download",
                     key=f"prepare_vid_{job['id']}",
                     use_container_width=True,
                     disabled=not bool(media_id),
@@ -1393,6 +1590,7 @@ def main():
     social_token = get_secret("SOCIAVAULT_API_KEY")
     flow_email = get_secret("GOOGLE_FLOW_EMAIL")
     region = get_secret("SOCIAVAULT_REGION", "US") or "US"
+    default_google_sheet_url = get_secret("GOOGLE_SHEET_URL")
 
     # ---------------- Sidebar: setup only ----------------
     avatar_bytes = None
@@ -1459,6 +1657,7 @@ def main():
             if st.button("Clear current batch", use_container_width=True):
                 st.session_state.pop("jobs", None)
                 st.session_state.pop("videos_zip", None)
+                st.session_state.pop("full_batch_zip", None)
                 st.rerun()
 
     avatar_hash = hashlib.sha1(avatar_bytes).hexdigest() if avatar_bytes else ""
@@ -1533,6 +1732,7 @@ def main():
             by_url = {j["url"]: j for j in imported}
             st.session_state["jobs"] = [by_url[x] for x in links if x in by_url]
             st.session_state.pop("videos_zip", None)
+            st.session_state.pop("full_batch_zip", None)
             if errors:
                 st.session_state["import_errors"] = errors
             st.rerun()
@@ -1808,28 +2008,79 @@ def main():
 
         st.write("")
         with st.container(border=True):
-            st.markdown("<div class='panel-title'>Batch downloads</div>", unsafe_allow_html=True)
-            st.markdown("<div class='panel-sub'>Package completed files only, or save the batch manifest for reference.</div>", unsafe_allow_html=True)
-            d1, d2, d3 = st.columns(3)
+            st.markdown("<div class='panel-title'>Export batch</div>", unsafe_allow_html=True)
+            st.markdown("<div class='panel-sub'>Download the product list, individual media packages, or one ZIP containing the full finished batch.</div>", unsafe_allow_html=True)
+
+            csv_bytes = jobs_to_csv(jobs)
+            e1, e2, e3 = st.columns(3)
+            e1.download_button(
+                "↓ Download product CSV",
+                data=csv_bytes,
+                file_name="flow_tryon_products.csv",
+                mime="text/csv",
+                use_container_width=True,
+                help="Includes each original TikTok Shop product link plus generation IDs/statuses.",
+            )
+            e2.download_button(
+                "↓ Download manifest JSON",
+                data=jobs_to_manifest(jobs),
+                file_name="flow_tryon_batch.json",
+                mime="application/json",
+                use_container_width=True,
+            )
             images_zip = build_images_zip(jobs)
             if images_zip:
-                d1.download_button("Download all images", data=images_zip, file_name="flow_tryon_images.zip", mime="application/zip", use_container_width=True)
+                e3.download_button("↓ Download all images", data=images_zip, file_name="flow_tryon_images.zip", mime="application/zip", use_container_width=True)
             else:
-                d1.button("Download all images", disabled=True, use_container_width=True)
+                e3.button("↓ Download all images", disabled=True, use_container_width=True)
 
-            if any(j.get("video_status") == "completed" for j in jobs):
-                if d2.button("Prepare videos ZIP", use_container_width=True):
-                    with st.spinner("Downloading completed videos from Flow..."):
-                        z = build_videos_zip(jobs, token)
-                    if z:
-                        st.session_state["videos_zip"] = z
-                        st.rerun()
-                if st.session_state.get("videos_zip"):
-                    d2.download_button("Download all videos", data=st.session_state["videos_zip"], file_name="flow_tryon_videos.zip", mime="application/zip", use_container_width=True)
+            st.divider()
+            st.markdown("<div class='panel-title'>Download entire batch</div>", unsafe_allow_html=True)
+            st.markdown("<div class='panel-sub'>Creates one ZIP with batch.csv, manifest.json, completed try-on images, and completed MP4 videos.</div>", unsafe_allow_html=True)
+            b1, b2 = st.columns([1, 2])
+            if b1.button("Prepare full batch ZIP", type="primary", use_container_width=True):
+                with st.spinner("Collecting completed images and MP4 videos from Flow…"):
+                    payload, counts = build_full_batch_zip(jobs, token)
+                if payload:
+                    st.session_state["full_batch_zip"] = payload
+                    st.session_state["full_batch_zip_counts"] = counts
+                    st.rerun()
+            if st.session_state.get("full_batch_zip"):
+                counts = st.session_state.get("full_batch_zip_counts") or {}
+                b2.download_button(
+                    f"↓ Download entire batch · {counts.get('images', 0)} images · {counts.get('videos', 0)} videos",
+                    data=st.session_state["full_batch_zip"],
+                    file_name="flow_tryon_full_batch.zip",
+                    mime="application/zip",
+                    use_container_width=True,
+                )
+
+            st.divider()
+            st.markdown("<div class='panel-title'>Google Sheets</div>", unsafe_allow_html=True)
+            st.markdown("<div class='panel-sub'>Push the same export rows to a Google Sheet. Share the Sheet with your service-account email as Editor once, then the app can update it without a Google sign-in.</div>", unsafe_allow_html=True)
+            gs1, gs2 = st.columns([2, 1])
+            sheet_url = gs1.text_input(
+                "Google Sheet URL",
+                value=default_google_sheet_url,
+                placeholder="https://docs.google.com/spreadsheets/d/...",
+                key="google_sheet_url",
+            )
+            tab_name = gs2.text_input("Worksheet/tab", value="Flow Try-On", key="google_sheet_tab")
+            gs3, gs4 = st.columns([1, 2])
+            push_mode = gs3.selectbox("Push mode", ["Replace tab", "Append rows"], key="google_sheet_mode")
+            service_info = get_google_service_account_info()
+            if service_info and service_info.get("client_email"):
+                gs4.caption(f"Share the Sheet with: {service_info.get('client_email')} · Editor")
             else:
-                d2.button("Download all videos", disabled=True, use_container_width=True)
+                gs4.caption("Google Sheets not configured yet. Add a service-account credential in Streamlit Secrets.")
 
-            d3.download_button("Download manifest", data=jobs_to_manifest(jobs), file_name="flow_tryon_batch.json", mime="application/json", use_container_width=True)
+            if st.button("↗ Push batch to Google Sheet", use_container_width=True, disabled=not bool(sheet_url)):
+                with st.spinner("Updating Google Sheet…"):
+                    ok, message = push_jobs_to_google_sheet(jobs, sheet_url, tab_name, push_mode)
+                if ok:
+                    st.success(message)
+                else:
+                    st.error(message)
 
 
 if __name__ == "__main__":

@@ -65,3 +65,18 @@ This UI version automatically polls async Omni 1.1 Flash jobs after submission. 
 ## R8 fix
 - Fixed Flow async video polling: preserves literal `:` / `@` separators in useapi job IDs so `/jobs/{jobId}` no longer returns HTTP 400 Invalid job ID format.
 - Existing submitted jobs can be recovered from the `flow_jobs` URL parameter or the recovery panel; do not resubmit merely because an older build failed to poll them.
+
+## R9 exports + batch download
+- Completed Omni videos render directly in **Results** when a signed preview URL is available; the app also exposes refresh/prepare-download controls per video.
+- **Download entire batch** creates one ZIP containing `batch.csv`, `manifest.json`, completed try-on images, and completed MP4 videos.
+- **Download product CSV** includes the original TikTok Shop product URL, product ID/name, image/video statuses, useapi media IDs/job ID, and generated URLs.
+- Optional **Google Sheets push** supports replacing a worksheet tab or appending rows.
+
+### Google Sheets setup
+1. In Google Cloud, create a service account and enable the **Google Sheets API** and **Google Drive API** for its project.
+2. Create/download a JSON key for that service account.
+3. In Streamlit Cloud → App → Settings → Secrets, add the JSON as `GOOGLE_SERVICE_ACCOUNT_JSON` (see `.streamlit/secrets.example.toml`).
+4. Open the target Google Sheet and share it with the service account's `client_email` as **Editor**.
+5. In the app's Results → Export batch → Google Sheets section, paste the Sheet URL and press **Push batch to Google Sheet**.
+
+Use **Replace tab** to keep one current batch snapshot, or **Append rows** to build a running log.
