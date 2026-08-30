@@ -91,7 +91,8 @@ def get_drive_archive_config() -> dict:
     Google service accounts have no Drive storage quota and cannot own files in
     My Drive, so the service account used for Sheets is not a durable media store.
     """
-    url = get_secret("GOOGLE_DRIVE_ARCHIVE_WEBHOOK_URL")
+    # Accept both secret names for backward compatibility with the setup guide.
+    url = get_secret("GOOGLE_DRIVE_ARCHIVE_WEBHOOK_URL") or get_secret("GOOGLE_DRIVE_ARCHIVE_URL")
     secret = get_secret("GOOGLE_DRIVE_ARCHIVE_SECRET")
     auto_raw = get_secret("GOOGLE_DRIVE_AUTO_ARCHIVE", "true").lower()
     return {
