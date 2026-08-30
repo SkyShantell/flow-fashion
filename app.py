@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import html
 import io
 import json
 import os
@@ -487,25 +488,41 @@ def image_bytes_from_result(result: dict) -> bytes | None:
     return None
 
 
+def _normalize_remote_url(value) -> str:
+    """Normalize CDN/image URL values returned by SociaVault/TikTok."""
+    if value is None:
+        return ""
+    url = html.unescape(str(value)).strip().strip('"\'')
+    if url.startswith("//"):
+        url = "https:" + url
+    if url.startswith(("http://", "https://")):
+        return url
+    return ""
+
+
 def _sv_values(value):
     if isinstance(value, list):
         return value
+    if isinstance(value, tuple):
+        return list(value)
     if isinstance(value, dict):
         return list(value.values())
+    if isinstance(value, str):
+        return [value]
     return []
 
 
 def _sv_first_url(value) -> str:
     if isinstance(value, str):
-        return value.strip() if value.startswith(("http://", "https://")) else ""
+        return _normalize_remote_url(value)
     if not isinstance(value, dict):
         return ""
-    for key in ("url_list", "urlList", "urls", "review_images", "reviewImages"):
+    for key in ("url_list", "urlList", "urls", "review_images", "reviewImages", "images"):
         for candidate in _sv_values(value.get(key)):
             url = _sv_first_url(candidate)
             if url:
                 return url
-    for key in ("url", "image_url", "imageUrl", "display_image_url", "displayImageUrl", "original_url", "originalUrl", "preview_url", "previewUrl"):
+    for key in ("url", "image_url", "imageUrl", "display_image_url", "displayImageUrl", "original_url", "originalUrl", "preview_url", "previewUrl", "src"):
         url = _sv_first_url(value.get(key))
         if url:
             return url
@@ -516,20 +533,20 @@ def _sv_first_url(value) -> str:
     return ""
 
 
-def _sv_collect_urls(value, max_depth=7):
+def _sv_collect_urls(value, max_depth=8):
     urls = []
     def add(url):
-        url = str(url or "").strip()
-        if url.startswith(("http://", "https://")) and url not in urls:
+        url = _normalize_remote_url(url)
+        if url and url not in urls:
             urls.append(url)
     def walk(node, depth=0, path=()):
         if depth > max_depth:
             return
         if isinstance(node, str):
             p = " ".join(path).lower()
-            if node.startswith(("http://", "https://")) and not any(x in p for x in ("avatar", "profile", "seller", "shop_logo", "icon")):
+            if not any(x in p for x in ("avatar", "profile", "seller", "shop_logo", "icon")):
                 add(node)
-        elif isinstance(node, list):
+        elif isinstance(node, (list, tuple)):
             for child in node:
                 walk(child, depth + 1, path)
         elif isinstance(node, dict):
@@ -538,13 +555,9 @@ def _sv_collect_urls(value, max_depth=7):
             if best and not any(x in p for x in ("avatar", "profile", "seller", "shop_logo", "icon")):
                 add(best)
             for key, child in node.items():
-                key_l = str(key).lower()
-                if key_l in {"url_list", "urllist", "thumb_url_list", "thumburllist"} and best:
-                    continue
-                walk(child, depth + 1, path + (key_l,))
+                walk(child, depth + 1, path + (str(key).lower(),))
     walk(value)
     return urls
-
 
 def sociavault_get(endpoint: str, token: str, params: dict) -> dict:
     resp = requests.get(endpoint, headers={"X-API-Key": token, "Accept": "application/json"}, params=params, timeout=90)
@@ -576,14 +589,20 @@ def import_product(url: str, token: str, region: str) -> dict:
         product = {}
     name = str(product.get("title") or product.get("name") or "Unknown Product").strip()
     product_id = str(data.get("product_id") or product.get("id") or hashlib.sha1(url.encode()).hexdigest()[:12])
+    # SociaVault documents product_base.images as an array of image URLs, but
+    # handle strings, objects and nested variants defensively.
     listing = []
-    for obj in _sv_values(product.get("images")):
-        u = _sv_first_url(obj)
+    raw_images = product.get("images")
+    for obj in _sv_values(raw_images):
+        if isinstance(obj, str):
+            u = _normalize_remote_url(obj)
+        else:
+            u = _sv_first_url(obj)
         if u:
             listing.append(u)
     if not listing:
-        listing = _sv_collect_urls(product)[:18]
-    listing = dedupe(listing)[:18]
+        listing = _sv_collect_urls(raw_images or product)[:18]
+    listing = dedupe([_normalize_remote_url(u) for u in listing if _normalize_remote_url(u)])[:18]
 
     reviews = []
     review_block = data.get("product_detail_review") or {}
@@ -630,15 +649,24 @@ def import_product(url: str, token: str, region: str) -> dict:
 
 
 def classify_focus(name: str) -> str:
-    text = re.sub(r"[^a-z0-9]+", " ", (name or "").lower())
-    shoes = ("shoe", "sneaker", "boot", "heel", "sandal", "loafer", "clog", "slipper", "slides")
-    bottoms = ("pants", "pant", "jeans", "jean", "shorts", "short", "leggings", "legging", "jogger", "trouser", "skirt", "cargo")
-    outfits = ("set", "outfit", "tracksuit", "suit", "dress", "jumpsuit", "romper", "two piece", "2 piece", "matching")
-    tops = ("shirt", "t shirt", "tee", "hoodie", "sweater", "jacket", "coat", "blouse", "top", "tank", "cardigan", "jersey", "polo")
-    if any(k in text for k in shoes): return "shoes"
-    if any(k in text for k in outfits): return "outfit"
-    if any(k in text for k in bottoms): return "pants"
-    if any(k in text for k in tops): return "shirt"
+    # Token/phrase-aware classification. Avoid treating "short sleeve" as shorts/pants.
+    text = re.sub(r"[^a-z0-9]+", " ", (name or "").lower()).strip()
+    tokens = set(text.split())
+    shoes = {"shoe", "shoes", "sneaker", "sneakers", "boot", "boots", "heel", "heels", "sandal", "sandals", "loafer", "loafers", "clog", "clogs", "slipper", "slippers", "slides"}
+    tops = {"shirt", "tee", "hoodie", "sweater", "jacket", "coat", "blouse", "top", "tank", "cardigan", "jersey", "polo"}
+    bottoms = {"pants", "pant", "jeans", "jean", "shorts", "leggings", "legging", "jogger", "joggers", "trouser", "trousers", "skirt", "cargo"}
+    outfit_phrases = ("two piece", "2 piece", "matching set", "tracksuit", "jumpsuit", "romper")
+    outfit_tokens = {"set", "outfit", "suit", "dress"}
+
+    if tokens & shoes:
+        return "shoes"
+    if any(p in text for p in outfit_phrases) or tokens & outfit_tokens:
+        return "outfit"
+    # Check tops before bottoms so words such as "short sleeve polo shirt" remain tops.
+    if tokens & tops or "t shirt" in text:
+        return "shirt"
+    if tokens & bottoms:
+        return "pants"
     return "outfit"
 
 
@@ -692,11 +720,49 @@ Keep the phone naturally at face level most of the time. Maintain realistic anat
 """).strip()
 
 
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=256)
 def fetch_remote_image(url: str) -> tuple[bytes, str]:
-    resp = requests.get(url, timeout=60, headers={"User-Agent": "Mozilla/5.0", "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"})
+    """Fetch a product image through the Streamlit server.
+
+    Do not advertise AVIF support first: TikTok's CDN may return AVIF and the
+    default Pillow build on Streamlit Cloud may not decode it reliably.
+    """
+    url = _normalize_remote_url(url)
+    if not url:
+        raise RuntimeError("Invalid image URL")
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151 Safari/537.36",
+        "Accept": "image/webp,image/jpeg,image/png,image/*;q=0.8,*/*;q=0.4",
+        "Referer": "https://www.tiktok.com/",
+        "Cache-Control": "no-cache",
+    }
+    resp = requests.get(url, timeout=45, headers=headers, allow_redirects=True)
     resp.raise_for_status()
-    mime = (resp.headers.get("Content-Type") or "image/jpeg").split(";")[0]
-    return normalize_image_bytes(resp.content, mime)
+    if not resp.content or len(resp.content) < 64:
+        raise RuntimeError("Image response was empty")
+    mime = (resp.headers.get("Content-Type") or "image/jpeg").split(";")[0].lower()
+    if mime.startswith("text/") or "json" in mime:
+        raise RuntimeError(f"CDN returned {mime}, not an image")
+    normalized, normalized_mime = normalize_image_bytes(resp.content, mime, max_side=1400, quality=88)
+    # Validate that the normalized result is actually decodable before giving it to Streamlit.
+    try:
+        check = Image.open(io.BytesIO(normalized))
+        check.verify()
+    except Exception as exc:
+        raise RuntimeError(f"Unsupported/undecodable image format ({mime})") from exc
+    return normalized, normalized_mime
+
+
+def _browser_image_html(url: str, alt: str = "Product reference") -> str:
+    safe_url = html.escape(_normalize_remote_url(url), quote=True)
+    safe_alt = html.escape(alt, quote=True)
+    return (
+        f'<div style="width:100%;aspect-ratio:1/1.18;border:1px solid #26364c;border-radius:14px;'
+        f'overflow:hidden;background:#0d1521;display:flex;align-items:center;justify-content:center;">'
+        f'<img src="{safe_url}" alt="{safe_alt}" referrerpolicy="no-referrer" '
+        f'style="width:100%;height:100%;object-fit:contain;display:block;" />'
+        f'</div>'
+    )
 
 
 def ensure_job_refs(job: dict, token: str, email: str, avatar_id: str) -> tuple[list[str], dict]:
@@ -916,13 +982,76 @@ def _status_label(status: str) -> str:
     return labels.get(status, status.replace("_", " ").title())
 
 
-def render_job_editor(job: dict, index: int) -> dict:
-    """Focused product editor. Only one imported product is edited at a time."""
+def render_job_editor(job: dict, index: int, social_token: str = "", region: str = "US") -> dict:
+    """Focused product editor. Put the visual reference gallery first so it is immediately visible."""
     updated = dict(job)
     with st.container(border=True):
         st.markdown(f"<div class='product-title'>{index+1}. {_short_title(job.get('name'), 110)}</div>", unsafe_allow_html=True)
         st.markdown(f"<div class='product-id'>Product ID · {job.get('id','—')}</div>", unsafe_allow_html=True)
         st.write("")
+
+        # Gallery first: this is the main task on the Products screen.
+        st.markdown("<div class='panel-title'>Choose clothing references</div>", unsafe_allow_html=True)
+        st.markdown("<div class='panel-sub'>Select up to 5. Your avatar is always sent separately as reference #1.</div>", unsafe_allow_html=True)
+
+        candidates = [("Listing", _normalize_remote_url(u)) for u in job.get("listing_images", [])[:12]] + [("Review", _normalize_remote_url(u)) for u in job.get("review_images", [])[:8]]
+        candidates = [(k, u) for k, u in candidates if u]
+
+        info_c1, info_c2 = st.columns([1, 1])
+        with info_c1:
+            st.caption(f"SociaVault image URLs found: {len(candidates)}")
+        with info_c2:
+            if st.button("↻ Refresh product images", key=f"refresh_refs_{job['id']}", use_container_width=True, disabled=not bool(social_token)):
+                try:
+                    fresh = import_product(job.get("url", ""), social_token, region)
+                    updated["listing_images"] = fresh.get("listing_images", [])
+                    updated["review_images"] = fresh.get("review_images", [])
+                    fresh_refs = dedupe(updated["listing_images"][:2] + updated["review_images"][:1])[:MAX_PRODUCT_REFS]
+                    updated["selected_refs"] = fresh_refs
+                    updated = reset_generated(updated)
+                    st.session_state["refresh_job_refs"] = {"id": job.get("id"), "listing_images": updated["listing_images"], "review_images": updated["review_images"], "selected_refs": fresh_refs}
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not refresh product images: {exc}")
+
+        selected = []
+        failed_previews = 0
+        if not candidates:
+            st.error("SociaVault returned the product title, but no usable product image URLs for this item. Use Refresh product images above.")
+        else:
+            cols = st.columns(4, gap="small")
+            for n, (kind, url) in enumerate(candidates):
+                with cols[n % 4]:
+                    preview_ok = False
+                    try:
+                        thumb, _ = fetch_remote_image(url)
+                        st.image(thumb, use_container_width=True)
+                        preview_ok = True
+                    except Exception as exc:
+                        failed_previews += 1
+                        # Browser fallback bypasses Pillow/Streamlit decoding and handles AVIF in modern browsers.
+                        st.markdown(_browser_image_html(url, f"{kind} reference {n+1}"), unsafe_allow_html=True)
+                        st.caption(f"Browser fallback · {type(exc).__name__}")
+                    checked = st.checkbox(
+                        f"{kind} {n+1}",
+                        value=url in (job.get("selected_refs") or []),
+                        key=f"ref_{job['id']}_{hashlib.sha1(url.encode()).hexdigest()[:8]}",
+                    )
+                    if checked:
+                        selected.append(url)
+            if failed_previews:
+                st.caption(f"{failed_previews} preview(s) needed browser fallback. They can still be selected and used.")
+
+        if len(selected) > MAX_PRODUCT_REFS:
+            st.warning(f"Only the first {MAX_PRODUCT_REFS} checked references will be used.")
+            selected = selected[:MAX_PRODUCT_REFS]
+
+        if selected != (job.get("selected_refs") or []):
+            updated["selected_refs"] = selected
+            updated = reset_generated(updated)
+
+        st.caption(f"{len(updated.get('selected_refs') or [])}/{MAX_PRODUCT_REFS} references selected")
+        st.divider()
 
         c1, c2 = st.columns([1.55, 1], gap="large")
         with c1:
@@ -941,37 +1070,6 @@ def render_job_editor(job: dict, index: int) -> dict:
             value=bool(job.get("back_design")),
             key=f"back_{job['id']}",
         )
-
-        st.divider()
-        st.markdown("<div class='panel-title'>Choose clothing references</div>", unsafe_allow_html=True)
-        st.markdown("<div class='panel-sub'>Select up to 5. Your avatar is always sent separately as reference #1.</div>", unsafe_allow_html=True)
-
-        candidates = [("Listing", u) for u in job.get("listing_images", [])[:12]] + [("Review", u) for u in job.get("review_images", [])[:8]]
-        selected = []
-        if not candidates:
-            st.warning("No product reference images are available for this item.")
-        else:
-            cols = st.columns(5, gap="small")
-            for n, (kind, url) in enumerate(candidates):
-                with cols[n % 5]:
-                    st.image(url, use_container_width=True)
-                    checked = st.checkbox(
-                        f"{kind} {n+1}",
-                        value=url in (job.get("selected_refs") or []),
-                        key=f"ref_{job['id']}_{hashlib.sha1(url.encode()).hexdigest()[:8]}",
-                    )
-                    if checked:
-                        selected.append(url)
-
-        if len(selected) > MAX_PRODUCT_REFS:
-            st.warning(f"Only the first {MAX_PRODUCT_REFS} checked references will be used.")
-            selected = selected[:MAX_PRODUCT_REFS]
-
-        if selected != (job.get("selected_refs") or []):
-            updated["selected_refs"] = selected
-            updated = reset_generated(updated)
-
-        st.caption(f"{len(updated.get('selected_refs') or [])}/{MAX_PRODUCT_REFS} references selected")
     return updated
 
 
@@ -1435,6 +1533,17 @@ def main():
             st.warning(f"Could not import {_short_title(link, 65)} — {error}")
 
     jobs = st.session_state.get("jobs") or []
+    refreshed_refs = st.session_state.pop("refresh_job_refs", None)
+    if refreshed_refs and jobs:
+        for i, item in enumerate(jobs):
+            if str(item.get("id")) == str(refreshed_refs.get("id")):
+                item = dict(item)
+                item["listing_images"] = refreshed_refs.get("listing_images", [])
+                item["review_images"] = refreshed_refs.get("review_images", [])
+                item["selected_refs"] = refreshed_refs.get("selected_refs", [])
+                jobs[i] = reset_generated(item)
+                break
+        st.session_state["jobs"] = jobs
     if not jobs:
         with st.container(border=True):
             st.markdown("<div class='panel-title'>Start with your products</div>", unsafe_allow_html=True)
@@ -1464,7 +1573,7 @@ def main():
             format_func=lambda i: f"{i+1}. {_short_title(jobs[i].get('name'), 82)}",
             key="product_editor_index",
         )
-        edited = render_job_editor(jobs[selected_index], selected_index)
+        edited = render_job_editor(jobs[selected_index], selected_index, social_token, region)
         jobs[selected_index] = edited
         st.session_state["jobs"] = jobs
 
