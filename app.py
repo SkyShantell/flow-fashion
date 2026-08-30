@@ -1044,7 +1044,7 @@ def main():
                 st.caption("Upload the person used across this batch.")
 
         st.markdown("<div class='section-label'>BATCH SETTINGS</div>", unsafe_allow_html=True)
-        run_mode = st.radio("Pipeline", ["Review images first", "Full auto"], vertical=True)
+        run_mode = st.radio("Pipeline", ["Review images first", "Full auto"])
         scene = st.selectbox("Mirror setting", list(SCENES.keys()), index=0)
         st.caption("Nano Banana 2 · 9:16\n\nOmni 1.1 Flash · 8s · 720p")
 
