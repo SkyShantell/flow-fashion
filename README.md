@@ -111,3 +111,49 @@ R10 adds durable Google Drive copies of completed generated images and videos. T
 7. Redeploy/restart Streamlit. The sidebar should show **Drive archive · Ready**.
 
 The shared secret is required because the Apps Script web app must accept server-to-server requests from Streamlit. Do not publish that secret or commit it to GitHub.
+
+## R12 production workspace upgrade
+
+R12 keeps the working R11 Flow/useapi generation path and adds production-management features around it:
+
+- **Permanent Batch History** in the connected Google Sheet. A readable `Batch History` tab is created plus a hidden `_Flow Batch Data` tab containing compact reopenable state. The app can reopen old batches after a Streamlit restart/redeploy.
+- **Retry failed only** retries failed images and failed Omni video submissions without touching completed products.
+- **Production dashboard** adds filters for Ready, Processing, Failed, Needs approval, Ready for video, and Pending.
+- **Automatic Drive archiving** now includes selected product references as well as generated try-ons and completed videos.
+- **Product-first Drive folders** use `Product Name / YYYY-MM-DD / references / try-ons / videos`.
+- **Regenerate with instructions** lets an operator type a one-off correction such as “make the shirt looser” before regenerating a try-on.
+- **Automatic Sheet sync** updates the polished `Flow Try-On` tracker plus permanent batch history when meaningful state changes occur.
+- **Usage tracking** records image calls, video calls, retries, and generation failures per product and per batch. Optional image/video per-call rates can be entered in the sidebar to show an estimated batch cost.
+
+### Important: update the Apps Script archiver for the R12 folder structure
+
+The R12 app remains backward-compatible with the older Drive webhook, but the new product/date/reference folder structure requires updating the Apps Script deployment:
+
+1. Open the existing `Flow Try-On Archive` Apps Script project.
+2. Replace `Code.gs` with the included `google_drive_archiver.gs`.
+3. Save.
+4. Deploy → **Manage deployments** → Edit (pencil) → choose **New version** → Deploy.
+5. Keep the same Web App URL and the same `ARCHIVE_SECRET` / `ARCHIVE_FOLDER_ID` Script Properties.
+
+No Streamlit secret changes are required if the Web App URL remains the same.
+
+### Batch history behavior
+
+`GOOGLE_SHEET_URL` must be configured for persistent history. The app creates:
+
+- `Flow Try-On` — live, polished production tracker
+- `Batch History` — one summary row per batch
+- `_Flow Batch Data` — hidden technical state used to reopen previous batches
+
+Clearing the current Streamlit batch does **not** delete batch history.
+
+### Optional cost estimate
+
+Usage counts work automatically. If desired, set default cost rates in Streamlit Secrets:
+
+```toml
+FLOW_IMAGE_COST_USD = "0.00"
+FLOW_VIDEO_COST_USD = "0.00"
+```
+
+Or enter the current rates at runtime under **Sidebar → Usage cost rates**. Rates only affect the estimate; they never change generation behavior.

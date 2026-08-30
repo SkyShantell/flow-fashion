@@ -9,6 +9,7 @@ import re
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
@@ -31,6 +32,8 @@ IMAGE_WORKERS = 3
 IMPORT_WORKERS = 4
 VIDEO_POLL_INTERVAL = 8
 VIDEO_WAIT_TIMEOUT = 600
+BATCH_HISTORY_TAB = "Batch History"
+BATCH_DATA_TAB = "_Flow Batch Data"
 
 SCENES = {
     "Modern apartment mirror": "a realistic modern upscale apartment with a large full-length mirror, warm ceiling lighting, neutral furniture, and believable lived-in details",
@@ -101,6 +104,122 @@ def get_drive_archive_config() -> dict:
         "configured": bool(url and secret),
         "auto": auto_raw not in {"0", "false", "no", "off"},
     }
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _new_batch_id(jobs: list[dict]) -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    seed = "|".join(str(j.get("url") or j.get("id") or j.get("name") or "") for j in jobs)
+    digest = hashlib.sha1(f"{seed}|{time.time_ns()}".encode("utf-8")).hexdigest()[:7]
+    return f"{stamp}-{digest}"
+
+
+def ensure_batch_metadata(jobs: list[dict], *, force_new: bool = False, batch_id: str = "", created_at: str = "") -> tuple[str, str]:
+    """Ensure the current Streamlit session has durable batch identity metadata."""
+    if force_new or not st.session_state.get("batch_id"):
+        st.session_state["batch_id"] = batch_id or _new_batch_id(jobs)
+        st.session_state["batch_created_at"] = created_at or _utc_now_iso()
+        st.session_state.pop("last_batch_sync_fingerprint", None)
+    elif batch_id:
+        st.session_state["batch_id"] = batch_id
+    if created_at:
+        st.session_state["batch_created_at"] = created_at
+    st.session_state.setdefault("batch_created_at", _utc_now_iso())
+    bid = str(st.session_state.get("batch_id") or _new_batch_id(jobs))
+    created = str(st.session_state.get("batch_created_at") or _utc_now_iso())
+    for job in jobs:
+        job["_batch_id"] = bid
+        job["_batch_created_at"] = created
+    return bid, created
+
+
+def _job_usage(job: dict) -> tuple[int, int, int, int]:
+    image_calls = int(job.get("image_attempts") or 0)
+    video_calls = int(job.get("video_attempts") or 0)
+    retries = max(0, image_calls - 1) + max(0, video_calls - 1)
+    failures = int(job.get("image_failures") or 0) + int(job.get("video_failures") or 0)
+    return image_calls, video_calls, retries, failures
+
+
+def batch_usage(jobs: list[dict]) -> dict:
+    out = {"image_calls": 0, "video_calls": 0, "retries": 0, "failures": 0}
+    for job in jobs:
+        a, b, c, d = _job_usage(job)
+        out["image_calls"] += a
+        out["video_calls"] += b
+        out["retries"] += c
+        out["failures"] += d
+    return out
+
+
+def usage_cost_estimate(jobs: list[dict]) -> tuple[float, bool]:
+    try:
+        image_rate = float(st.session_state.get("image_cost_rate", get_secret("FLOW_IMAGE_COST_USD", "0")) or 0)
+        video_rate = float(st.session_state.get("video_cost_rate", get_secret("FLOW_VIDEO_COST_USD", "0")) or 0)
+    except Exception:
+        image_rate = video_rate = 0.0
+    usage = batch_usage(jobs)
+    return usage["image_calls"] * image_rate + usage["video_calls"] * video_rate, bool(image_rate or video_rate)
+
+
+def _dashboard_stage(job: dict) -> str:
+    image_status = str(job.get("image_status") or "pending").lower()
+    video_status = str(job.get("video_status") or "pending").lower()
+    if image_status == "failed" or video_status == "failed":
+        return "Failed"
+    if video_status == "completed":
+        return "Ready"
+    if job.get("video_job_id") and video_status not in {"completed", "failed"}:
+        return "Processing"
+    if image_status == "completed" and not job.get("approved"):
+        return "Needs approval"
+    if image_status == "completed" and job.get("approved"):
+        return "Ready for video"
+    return "Pending"
+
+
+def _batch_status(jobs: list[dict]) -> str:
+    if not jobs:
+        return "Empty"
+    stages = [_dashboard_stage(j) for j in jobs]
+    if all(x == "Ready" for x in stages):
+        return "Complete"
+    if any(x == "Failed" for x in stages):
+        return "Needs attention"
+    if any(x == "Processing" for x in stages):
+        return "Processing"
+    if any(x == "Needs approval" for x in stages):
+        return "Needs approval"
+    return "In progress"
+
+
+def _persistable_job(job: dict) -> dict:
+    """Compact state snapshot for reopening a batch later; intentionally excludes image base64."""
+    allowed = {
+        "url", "id", "name", "focus", "back_design", "selected_refs",
+        "image_status", "image_job_id", "image_media_id", "image_url", "image_seed", "image_error", "approved",
+        "video_status", "video_job_id", "video_submitted_at", "video_url", "video_media_id", "video_error", "thumbnail_url",
+        "drive_image_id", "drive_image_url", "drive_image_download_url", "drive_image_error",
+        "drive_video_id", "drive_video_url", "drive_video_download_url", "drive_video_error",
+        "drive_batch_folder_url", "drive_product_folder_url",
+        "drive_reference_ids", "drive_reference_urls", "drive_reference_download_urls", "drive_reference_errors",
+        "regen_instruction", "last_regen_instruction",
+        "image_attempts", "video_attempts", "image_failures", "video_failures", "sheet_row",
+        "_batch_id", "_batch_created_at",
+    }
+    return {k: v for k, v in job.items() if k in allowed}
+
+
+def _batch_sync_fingerprint(jobs: list[dict]) -> str:
+    payload = {
+        "batch_id": st.session_state.get("batch_id"),
+        "created": st.session_state.get("batch_created_at"),
+        "jobs": [_persistable_job(j) for j in jobs],
+    }
+    return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
 
 def inject_css():
@@ -752,10 +871,12 @@ def image_prompt(job: dict, scene: str, refs_count: int) -> str:
         focus_rule = "The full outfit is the hero. Show the top and bottom together clearly from head to toe with believable fit, drape and proportions."
         fallback = "Do not substitute, redesign, or add a different matching piece."
     back = "The product references indicate a back design; use a slight angled pose that hints at it without hiding the front." if job.get("back_design") else ""
+    revision = str(job.get("active_regen_instruction") or "").strip()
+    revision_rule = f"OPERATOR REVISION REQUEST: {revision}. Apply this request while preserving the exact product and avatar." if revision else ""
     return re.sub(r"\s+", " ", f"""
 Create one photorealistic vertical 9:16 iPhone mirror-selfie image for a TikTok clothing try-on.
 REFERENCE RULES: @reference_1 is the exact PERSON/AVATAR. Preserve this person's identity, face, skin, hair, body build and visible personal features. Do not copy the avatar's original clothes. {ref_mentions} are CLOTHING/PRODUCT references for {product}. Ignore any people/models appearing in those clothing references and use only the actual product design, colors, materials, print, construction and fit cues.
-Dress @reference_1 in the exact product shown by the clothing references. {focus_rule} {fallback} {back}
+Dress @reference_1 in the exact product shown by the clothing references. {focus_rule} {fallback} {back} {revision_rule}
 Scene: {SCENES[scene]}. The person holds a black smartphone at face level in one hand while taking a natural full-length mirror selfie. Full body head-to-toe must stay in frame. Casual confident UGC posture, slight weight shift, natural imperfect framing.
 Realism: authentic smartphone photo, natural skin texture, realistic hands and fingers, believable fabric folds and seams, subtle sensor grain, mild phone-camera compression, no studio lighting, no glossy commercial fashion look, no extra people, no duplicated limbs, no morphing, no text overlays, no prices, no added logos or watermarks. The image must look like an ordinary creator actually trying on the product.
 """).strip()
@@ -848,6 +969,7 @@ def ensure_job_refs(job: dict, token: str, email: str, avatar_id: str) -> tuple[
 
 def generate_one_image(job: dict, token: str, email: str, avatar_id: str, scene: str) -> dict:
     updated = dict(job)
+    updated["image_attempts"] = int(updated.get("image_attempts") or 0) + 1
     try:
         refs, updated = ensure_job_refs(updated, token, email, avatar_id)
         result = flow_generate_image(token, email, image_prompt(updated, scene, len(refs)), refs)
@@ -879,6 +1001,8 @@ def generate_one_image(job: dict, token: str, email: str, avatar_id: str, scene:
     except Exception as exc:
         updated["image_status"] = "failed"
         updated["image_error"] = str(exc)
+        updated["image_failures"] = int(updated.get("image_failures") or 0) + 1
+    updated.pop("active_regen_instruction", None)
     return updated
 
 
@@ -888,6 +1012,7 @@ def submit_one_video(job: dict, token: str, email: str) -> dict:
         updated["video_status"] = "failed"
         updated["video_error"] = "No completed image media ID."
         return updated
+    updated["video_attempts"] = int(updated.get("video_attempts") or 0) + 1
     try:
         result = flow_submit_video(token, email, updated["image_media_id"], video_prompt(updated))
         updated.update({
@@ -905,6 +1030,7 @@ def submit_one_video(job: dict, token: str, email: str) -> dict:
     except Exception as exc:
         updated["video_status"] = "failed"
         updated["video_error"] = str(exc)
+        updated["video_failures"] = int(updated.get("video_failures") or 0) + 1
     return updated
 
 
@@ -1006,6 +1132,12 @@ def jobs_export_rows(jobs: list[dict]) -> tuple[list[str], list[list[str]]]:
         "Google Drive video file ID",
         "Google Drive batch folder",
         "Selected reference URLs",
+        "Regeneration instruction",
+        "Image calls",
+        "Video calls",
+        "Retries",
+        "Generation failures",
+        "Sheet row",
     ]
     rows = []
     for i, job in enumerate(jobs, 1):
@@ -1028,8 +1160,14 @@ def jobs_export_rows(jobs: list[dict]) -> tuple[list[str], list[list[str]]]:
             str(job.get("video_job_id") or ""),
             str(job.get("drive_video_url") or ""),
             str(job.get("drive_video_id") or ""),
-            str(job.get("drive_batch_folder_url") or ""),
+            str(job.get("drive_product_folder_url") or job.get("drive_batch_folder_url") or ""),
             " | ".join(str(x) for x in (job.get("selected_refs") or []) if x),
+            str(job.get("last_regen_instruction") or job.get("regen_instruction") or ""),
+            str(_job_usage(job)[0]),
+            str(_job_usage(job)[1]),
+            str(_job_usage(job)[2]),
+            str(_job_usage(job)[3]),
+            str(job.get("sheet_row") or ""),
         ])
     return headers, rows
 
@@ -1076,11 +1214,15 @@ def download_video_for_job(token: str, job: dict) -> bytes | None:
         if data:
             return data
     url = str(job.get("video_url") or "").strip()
-    if url:
+    if url and "drive.google.com" not in url:
         try:
             return download_url(url, 180)[0]
         except Exception:
-            return None
+            pass
+    if job.get("drive_video_id"):
+        data, _mime, _error = read_archived_drive_file(str(job.get("drive_video_id")))
+        if data:
+            return data
     return None
 
 
@@ -1139,8 +1281,14 @@ def image_bytes_for_job(job: dict) -> tuple[bytes | None, str]:
             return base64.b64decode(job["image_encoded"]), "image/jpeg"
         except Exception:
             pass
-    url = str(job.get("image_url") or "").strip()
-    if url:
+    if job.get("drive_image_id"):
+        data, mime, _ = read_archived_drive_file(str(job.get("drive_image_id")))
+        if data:
+            return data, (mime or "image/jpeg")
+    for raw_url in (job.get("drive_image_download_url"), job.get("image_url"), job.get("drive_image_url")):
+        url = str(raw_url or "").strip()
+        if not url:
+            continue
         try:
             data, mime = download_url(url, 120)
             return data, (mime or "image/jpeg")
@@ -1163,7 +1311,7 @@ def _archive_filename(index: int, job: dict, kind: str) -> str:
     return f"{index:02d}_{safe_name(job.get('name'))}_{media_tag}.{ext}"
 
 
-def archive_bytes_to_google_drive(data: bytes, mime_type: str, filename: str, kind: str, batch_name: str, description: str = "") -> tuple[dict | None, str]:
+def archive_bytes_to_google_drive(data: bytes, mime_type: str, filename: str, kind: str, batch_name: str, description: str = "", product_name: str = "", batch_date: str = "") -> tuple[dict | None, str]:
     """Upload one media file to the user's Drive through the Apps Script bridge."""
     cfg = get_drive_archive_config()
     if not cfg["configured"]:
@@ -1177,6 +1325,8 @@ def archive_bytes_to_google_drive(data: bytes, mime_type: str, filename: str, ki
         "mime_type": mime_type,
         "kind": kind,
         "batch_name": batch_name,
+        "product_name": product_name,
+        "batch_date": batch_date,
         "description": description,
         "data_base64": base64.b64encode(data).decode("ascii"),
     }
@@ -1195,56 +1345,136 @@ def archive_bytes_to_google_drive(data: bytes, mime_type: str, filename: str, ki
         return None, f"Google Drive archive failed: {exc}"
 
 
+def read_archived_drive_file(file_id: str) -> tuple[bytes | None, str, str]:
+    """Retrieve a permanently archived private Drive file through the authenticated Apps Script bridge."""
+    cfg = get_drive_archive_config()
+    if not cfg["configured"] or not str(file_id or "").strip():
+        return None, "", "Drive archive is not configured or file ID is missing."
+    try:
+        resp = requests.post(
+            cfg["url"],
+            json={"secret": cfg["secret"], "action": "read", "file_id": str(file_id).strip()},
+            timeout=180,
+            allow_redirects=True,
+        )
+        if resp.status_code >= 400:
+            return None, "", f"Drive read HTTP {resp.status_code}: {resp.text[:240]}"
+        payload = resp.json()
+        if not payload.get("ok") or not payload.get("data_base64"):
+            return None, "", str(payload.get("error") or "Drive archive did not return file bytes.")
+        return base64.b64decode(payload["data_base64"]), str(payload.get("mime_type") or ""), ""
+    except Exception as exc:
+        return None, "", f"Drive archive read failed: {exc}"
+
+
 def archive_completed_jobs(jobs: list[dict], token: str, progress_callback=None) -> tuple[list[dict], dict]:
-    """Archive every completed image/video that does not already have a Drive copy."""
+    """Archive selected references plus every completed image/video into product/date folders."""
     current = [dict(j) for j in jobs]
     batch_name = drive_batch_name(current)
+    batch_date = str(st.session_state.get("batch_created_at") or _utc_now_iso())[:10]
     tasks = []
     for idx, job in enumerate(current):
+        selected_refs = list(job.get("selected_refs") or [])
+        ref_ids = list(job.get("drive_reference_ids") or [])
+        for ref_idx, ref_url in enumerate(selected_refs):
+            if ref_idx >= len(ref_ids) or not ref_ids[ref_idx]:
+                tasks.append((idx, "reference", ref_idx, ref_url))
         if job.get("image_status") == "completed" and not job.get("drive_image_id"):
-            tasks.append((idx, "image"))
+            tasks.append((idx, "image", None, None))
         if job.get("video_status") == "completed" and not job.get("drive_video_id"):
-            tasks.append((idx, "video"))
+            tasks.append((idx, "video", None, None))
 
-    report = {"uploaded": 0, "existing": 0, "failed": 0, "attempted": len(tasks), "errors": []}
-    for n, (idx, kind) in enumerate(tasks, 1):
+    report = {"uploaded": 0, "existing": 0, "failed": 0, "attempted": len(tasks), "references": 0, "images": 0, "videos": 0, "errors": []}
+    for n, (idx, kind, ref_idx, ref_url) in enumerate(tasks, 1):
         job = current[idx]
         if progress_callback:
             progress_callback(n - 1, len(tasks), kind, job)
-        if kind == "image":
+
+        if kind == "reference":
+            try:
+                data, mime = fetch_remote_image(str(ref_url))
+            except Exception as exc:
+                data, mime = None, "image/jpeg"
+                error = f"Could not retrieve reference {int(ref_idx or 0)+1} for {job.get('name') or 'product'}: {exc}"
+        elif kind == "image":
             data, mime = image_bytes_for_job(job)
+            error = f"Could not retrieve image bytes for {job.get('name') or 'product'}."
         else:
             data = download_video_for_job(token, job)
             mime = "video/mp4"
+            error = f"Could not retrieve video bytes for {job.get('name') or 'product'}."
+
         if not data:
-            message = f"Could not retrieve {kind} bytes for {job.get('name') or 'product'}."
-            job[f"drive_{kind}_error"] = message
+            if kind == "reference":
+                errors = list(job.get("drive_reference_errors") or [])
+                while len(errors) <= int(ref_idx or 0): errors.append("")
+                errors[int(ref_idx or 0)] = error
+                job["drive_reference_errors"] = errors
+            else:
+                job[f"drive_{kind}_error"] = error
             report["failed"] += 1
-            report["errors"].append(message)
+            report["errors"].append(error)
             continue
 
-        description = f"Flow Try-On Factory | Product: {job.get('name') or ''} | Product URL: {job.get('url') or ''} | Media ID: {job.get('image_media_id') if kind == 'image' else job.get('video_media_id') or ''}"
+        if kind == "reference":
+            source_tag = hashlib.sha1(str(ref_url).encode("utf-8")).hexdigest()[:10]
+            filename = f"ref_{int(ref_idx or 0)+1:02d}_{source_tag}.jpg"
+            media_id = source_tag
+        else:
+            filename = _archive_filename(idx + 1, job, kind)
+            media_id = job.get("image_media_id") if kind == "image" else job.get("video_media_id") or ""
+        description = f"Flow Try-On Factory | Product: {job.get('name') or ''} | Product URL: {job.get('url') or ''} | Media ID: {media_id}"
         payload, error = archive_bytes_to_google_drive(
             data=data,
             mime_type=mime,
-            filename=_archive_filename(idx + 1, job, kind),
+            filename=filename,
             kind=kind,
             batch_name=batch_name,
             description=description,
+            product_name=str(job.get("name") or f"Product {idx+1}"),
+            batch_date=batch_date,
         )
         if payload:
-            job[f"drive_{kind}_id"] = str(payload.get("file_id") or "")
-            job[f"drive_{kind}_url"] = str(payload.get("view_url") or payload.get("download_url") or "")
-            job[f"drive_{kind}_download_url"] = str(payload.get("download_url") or "")
-            job[f"drive_{kind}_error"] = None
+            if kind == "reference":
+                ids = list(job.get("drive_reference_ids") or [])
+                urls = list(job.get("drive_reference_urls") or [])
+                downloads = list(job.get("drive_reference_download_urls") or [])
+                errors = list(job.get("drive_reference_errors") or [])
+                while len(ids) <= int(ref_idx or 0): ids.append("")
+                while len(urls) <= int(ref_idx or 0): urls.append("")
+                while len(downloads) <= int(ref_idx or 0): downloads.append("")
+                while len(errors) <= int(ref_idx or 0): errors.append("")
+                ids[int(ref_idx or 0)] = str(payload.get("file_id") or "")
+                urls[int(ref_idx or 0)] = str(payload.get("view_url") or "")
+                downloads[int(ref_idx or 0)] = str(payload.get("download_url") or "")
+                errors[int(ref_idx or 0)] = ""
+                job["drive_reference_ids"] = ids
+                job["drive_reference_urls"] = urls
+                job["drive_reference_download_urls"] = downloads
+                job["drive_reference_errors"] = errors
+                report["references"] += 1
+            else:
+                job[f"drive_{kind}_id"] = str(payload.get("file_id") or "")
+                job[f"drive_{kind}_url"] = str(payload.get("view_url") or payload.get("download_url") or "")
+                job[f"drive_{kind}_download_url"] = str(payload.get("download_url") or "")
+                job[f"drive_{kind}_error"] = None
+                report["images" if kind == "image" else "videos"] += 1
             if payload.get("batch_folder_url"):
                 job["drive_batch_folder_url"] = str(payload.get("batch_folder_url"))
+            if payload.get("product_folder_url"):
+                job["drive_product_folder_url"] = str(payload.get("product_folder_url"))
             if payload.get("existing"):
                 report["existing"] += 1
             else:
                 report["uploaded"] += 1
         else:
-            job[f"drive_{kind}_error"] = error
+            if kind == "reference":
+                errors = list(job.get("drive_reference_errors") or [])
+                while len(errors) <= int(ref_idx or 0): errors.append("")
+                errors[int(ref_idx or 0)] = error
+                job["drive_reference_errors"] = errors
+            else:
+                job[f"drive_{kind}_error"] = error
             report["failed"] += 1
             report["errors"].append(error)
         if progress_callback:
@@ -1305,6 +1535,12 @@ def _format_google_sheet(book, ws, headers: list[str], data_rows: int) -> None:
         17: 155, # Drive video ID (hidden)
         18: 118, # Archive folder
         19: 280, # Selected refs (hidden)
+        20: 250, # Regeneration instruction
+        21: 82,  # Image calls
+        22: 82,  # Video calls
+        23: 72,  # Retries
+        24: 82,  # Failures
+        25: 72,  # Sheet row
     }
     hidden_cols = {3, 8, 9, 11, 13, 14, 15, 17, 19}
 
@@ -1424,10 +1660,18 @@ def push_jobs_to_google_sheet(jobs: list[dict], spreadsheet_url: str, worksheet_
             existing = ws.get_all_values()
             if not existing:
                 ws.update(range_name="A1", values=[headers])
+            start_row = max(len(existing), 1) + 1
+            for i, job in enumerate(jobs):
+                job["sheet_row"] = start_row + i
+            headers, rows = _jobs_sheet_rows(jobs)
             if rows:
                 ws.append_rows(rows, value_input_option="USER_ENTERED", insert_data_option="INSERT_ROWS")
             final_row_count = max(len(existing), 1) + len(rows)
         else:
+            for i, job in enumerate(jobs):
+                job["sheet_row"] = i + 2
+            headers, rows = _jobs_sheet_rows(jobs)
+            values = [headers] + rows
             ws.clear()
             ws.update(range_name="A1", values=values, value_input_option="USER_ENTERED")
             final_row_count = len(rows) + 1
@@ -1443,6 +1687,231 @@ def push_jobs_to_google_sheet(jobs: list[dict], spreadsheet_url: str, worksheet_
         return True, f"Pushed {len(rows)} product(s) to '{tab_name}' and formatted it for easier reading. Connected as {service_email}.{format_warning}"
     except Exception as exc:
         return False, f"Google Sheets push failed: {exc}"
+
+
+def _open_google_book(spreadsheet_url: str):
+    info = get_google_service_account_info()
+    if not info:
+        raise RuntimeError("Google Sheets is not configured.")
+    import gspread
+    gc = gspread.service_account_from_dict(info)
+    ref = str(spreadsheet_url or "").strip()
+    return (gc.open_by_url(ref) if ref.startswith(("http://", "https://")) else gc.open_by_key(ref)), gspread
+
+
+def persist_batch_history_to_google_sheet(jobs: list[dict], spreadsheet_url: str) -> tuple[bool, str]:
+    """Upsert a readable batch summary plus compact raw state for future reopening."""
+    if not jobs or not spreadsheet_url:
+        return False, "No batch or Google Sheet URL."
+    batch_id, created_at = ensure_batch_metadata(jobs)
+    updated_at = _utc_now_iso()
+    usage = batch_usage(jobs)
+    estimated_cost, has_cost_rates = usage_cost_estimate(jobs)
+    images_ready = sum(1 for j in jobs if j.get("image_status") == "completed")
+    approved = sum(1 for j in jobs if j.get("approved"))
+    videos_ready = sum(1 for j in jobs if j.get("video_status") == "completed")
+    processing = sum(1 for j in jobs if _dashboard_stage(j) == "Processing")
+    failed = sum(1 for j in jobs if _dashboard_stage(j) == "Failed")
+    folder_url = next((str(j.get("drive_batch_folder_url") or "") for j in jobs if j.get("drive_batch_folder_url")), "")
+    try:
+        book, gspread = _open_google_book(spreadsheet_url)
+        history_headers = ["Batch ID", "Created", "Updated", "Products", "Images ready", "Approved", "Videos ready", "Processing", "Failed", "Image calls", "Video calls", "Retries", "Est. cost", "Drive folder", "Status"]
+        try:
+            ws = book.worksheet(BATCH_HISTORY_TAB)
+        except gspread.WorksheetNotFound:
+            ws = book.add_worksheet(title=BATCH_HISTORY_TAB, rows=300, cols=len(history_headers) + 2)
+        existing = ws.get_all_values()
+        ws.update(range_name="A1", values=[history_headers])
+        if not existing:
+            existing = [history_headers]
+        row = [
+            batch_id, created_at, updated_at, str(len(jobs)), str(images_ready), str(approved), str(videos_ready), str(processing), str(failed),
+            str(usage["image_calls"]), str(usage["video_calls"]), str(usage["retries"]), f"${estimated_cost:,.2f}" if has_cost_rates else "", _sheet_hyperlink(folder_url, "Open Drive") if folder_url else "", _batch_status(jobs),
+        ]
+        row_index = next((i + 1 for i, r in enumerate(existing[1:], start=1) if r and r[0] == batch_id), None)
+        if row_index:
+            ws.update(range_name=f"A{row_index}:O{row_index}", values=[row], value_input_option="USER_ENTERED")
+        else:
+            ws.append_row(row, value_input_option="USER_ENTERED")
+            row_index = len(existing) + 1
+        st.session_state["batch_history_row"] = row_index
+        # Basic readable formatting for the visible history tab.
+        try:
+            book.batch_update({"requests": [
+                {"updateSheetProperties": {"properties": {"sheetId": ws.id, "gridProperties": {"frozenRowCount": 1}}, "fields": "gridProperties.frozenRowCount"}},
+                {"repeatCell": {"range": {"sheetId": ws.id, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": len(history_headers)}, "cell": {"userEnteredFormat": {"backgroundColor": {"red": .075, "green": .094, "blue": .133}, "textFormat": {"bold": True, "foregroundColor": {"red": 1, "green": 1, "blue": 1}}}}, "fields": "userEnteredFormat(backgroundColor,textFormat)"}},
+            ]})
+        except Exception:
+            pass
+
+        # Hidden technical state tab. Rewrite only this compact table so batches survive Streamlit redeploys.
+        data_headers = ["Batch ID", "Product #", "Updated", "Job JSON"]
+        try:
+            data_ws = book.worksheet(BATCH_DATA_TAB)
+        except gspread.WorksheetNotFound:
+            data_ws = book.add_worksheet(title=BATCH_DATA_TAB, rows=1000, cols=6)
+        old = data_ws.get_all_values()
+        kept = [r[:4] for r in old[1:] if r and r[0] != batch_id]
+        current_rows = []
+        for i, job in enumerate(jobs, 1):
+            snap = _persistable_job(job)
+            snap["_batch_id"] = batch_id
+            snap["_batch_created_at"] = created_at
+            current_rows.append([batch_id, str(i), updated_at, json.dumps(snap, separators=(",", ":"), default=str)])
+        all_values = [data_headers] + kept + current_rows
+        data_ws.clear()
+        data_ws.update(range_name="A1", values=all_values, value_input_option="RAW")
+        try:
+            book.batch_update({"requests": [{"updateSheetProperties": {"properties": {"sheetId": data_ws.id, "hidden": True}, "fields": "hidden"}}]})
+        except Exception:
+            pass
+        return True, f"Batch history saved ({batch_id})."
+    except Exception as exc:
+        return False, f"Batch history sync failed: {exc}"
+
+
+def load_batch_history(spreadsheet_url: str) -> tuple[list[dict], str]:
+    if not spreadsheet_url:
+        return [], "Google Sheet URL is not configured."
+    try:
+        book, gspread = _open_google_book(spreadsheet_url)
+        try:
+            ws = book.worksheet(BATCH_HISTORY_TAB)
+        except gspread.WorksheetNotFound:
+            return [], "No saved batches yet."
+        values = ws.get_all_values()
+        if len(values) < 2:
+            return [], "No saved batches yet."
+        headers = values[0]
+        rows = []
+        for raw in values[1:]:
+            padded = raw + [""] * max(0, len(headers) - len(raw))
+            rows.append(dict(zip(headers, padded)))
+        rows.sort(key=lambda r: r.get("Created", ""), reverse=True)
+        return rows, ""
+    except Exception as exc:
+        return [], f"Could not load batch history: {exc}"
+
+
+def load_batch_jobs(spreadsheet_url: str, batch_id: str) -> tuple[list[dict], dict, str]:
+    try:
+        book, gspread = _open_google_book(spreadsheet_url)
+        try:
+            data_ws = book.worksheet(BATCH_DATA_TAB)
+        except gspread.WorksheetNotFound:
+            return [], {}, "Batch data tab does not exist yet."
+        values = data_ws.get_all_values()
+        found = []
+        for row in values[1:]:
+            if len(row) < 4 or row[0] != batch_id:
+                continue
+            try:
+                job = json.loads(row[3])
+                job["_product_index"] = int(row[1] or 0)
+                drive_refs = [x for x in (job.get("drive_reference_download_urls") or []) if x]
+                if drive_refs:
+                    job["selected_refs"] = drive_refs
+                    job["listing_images"] = drive_refs
+                    job["review_images"] = []
+                else:
+                    refs = list(job.get("selected_refs") or [])
+                    job["listing_images"] = refs
+                    job["review_images"] = []
+                if job.get("drive_image_download_url"):
+                    job["image_url"] = job.get("drive_image_download_url")
+                if job.get("drive_video_download_url"):
+                    job["video_url"] = job.get("drive_video_download_url")
+                job.pop("image_encoded", None)
+                found.append(job)
+            except Exception:
+                continue
+        found.sort(key=lambda j: int(j.pop("_product_index", 0)))
+        if not found:
+            return [], {}, f"No saved product state found for {batch_id}."
+        created = str(found[0].get("_batch_created_at") or "")
+        return found, {"batch_id": batch_id, "created_at": created}, ""
+    except Exception as exc:
+        return [], {}, f"Could not reopen batch: {exc}"
+
+
+def maybe_sync_batch(jobs: list[dict], spreadsheet_url: str, *, sync_current_tab: bool = True, force: bool = False) -> tuple[bool, str]:
+    """Auto-sync only when meaningful batch state changed, avoiding duplicate API traffic."""
+    if not jobs or not spreadsheet_url or not get_google_service_account_info():
+        return False, ""
+    ensure_batch_metadata(jobs)
+    fingerprint = _batch_sync_fingerprint(jobs)
+    if not force and fingerprint == st.session_state.get("last_batch_sync_fingerprint"):
+        return True, ""
+    messages = []
+    ok_current = True
+    if sync_current_tab:
+        ok_current, msg = push_jobs_to_google_sheet(jobs, spreadsheet_url, "Flow Try-On", "Replace tab")
+        if msg: messages.append(msg)
+    ok_history, hist_msg = persist_batch_history_to_google_sheet(jobs, spreadsheet_url)
+    if hist_msg: messages.append(hist_msg)
+    if ok_current and ok_history:
+        st.session_state["last_batch_sync_fingerprint"] = _batch_sync_fingerprint(jobs)
+        st.session_state["last_batch_sync_at"] = _utc_now_iso()
+        st.session_state.pop("batch_sync_error", None)
+        st.session_state.pop("batch_history_cache", None)
+        return True, " ".join(messages)
+    error = " ".join(messages)
+    st.session_state["batch_sync_error"] = error
+    return False, error
+
+
+def render_batch_history(spreadsheet_url: str) -> None:
+    st.markdown("<div class='panel-title'>Batch history</div>", unsafe_allow_html=True)
+    st.markdown("<div class='panel-sub'>Persistent history lives in your connected Google Sheet, so Streamlit redeploys do not erase prior batches.</div>", unsafe_allow_html=True)
+    if not spreadsheet_url:
+        st.info("Set GOOGLE_SHEET_URL to enable permanent batch history.")
+        return
+    c1, c2 = st.columns([1, 3])
+    if c1.button("↻ Refresh history", use_container_width=True, key="refresh_batch_history"):
+        st.session_state.pop("batch_history_cache", None)
+    if "batch_history_cache" not in st.session_state:
+        history, error = load_batch_history(spreadsheet_url)
+        st.session_state["batch_history_cache"] = history
+        st.session_state["batch_history_error"] = error
+    history = st.session_state.get("batch_history_cache") or []
+    error = st.session_state.get("batch_history_error") or ""
+    if error and not history:
+        st.info(error)
+        return
+    if not history:
+        st.info("No saved batches yet. Your current batch will appear here automatically after its first sync.")
+        return
+    table = []
+    for row in history[:100]:
+        table.append({
+            "Created": row.get("Created", ""), "Products": row.get("Products", ""), "Images": row.get("Images ready", ""),
+            "Approved": row.get("Approved", ""), "Videos": row.get("Videos ready", ""), "Processing": row.get("Processing", ""),
+            "Failed": row.get("Failed", ""), "Retries": row.get("Retries", ""), "Est. cost": row.get("Est. cost", ""), "Status": row.get("Status", ""), "Batch ID": row.get("Batch ID", ""),
+        })
+    st.dataframe(table, use_container_width=True, hide_index=True)
+    options = [r.get("Batch ID", "") for r in history if r.get("Batch ID")]
+    chosen = c2.selectbox("Saved batch", options=options, format_func=lambda bid: next((f"{r.get('Created','')} · {r.get('Products','0')} products · {r.get('Status','')}" for r in history if r.get('Batch ID') == bid), bid), key="history_batch_choice")
+    selected = next((r for r in history if r.get("Batch ID") == chosen), {})
+    h1, h2 = st.columns(2)
+    if h1.button("Open selected batch", type="primary", use_container_width=True, key="open_history_batch"):
+        loaded, meta, load_error = load_batch_jobs(spreadsheet_url, chosen)
+        if load_error:
+            st.error(load_error)
+        else:
+            st.session_state["jobs"] = loaded
+            ensure_batch_metadata(loaded, force_new=True, batch_id=meta.get("batch_id", chosen), created_at=meta.get("created_at", ""))
+            st.session_state.pop("avatar_flow_id", None)
+            st.session_state.pop("full_batch_zip", None)
+            st.session_state.pop("videos_zip", None)
+            st.success("Batch reopened.")
+            st.rerun()
+    drive_formula = str(selected.get("Drive folder") or "")
+    # History cells may return either a formula or displayed label via gspread. Prefer a folder URL from loaded state when possible.
+    if h2.button("Show batch details", use_container_width=True, key="show_history_details"):
+        st.session_state["show_history_details_for"] = chosen
+    if st.session_state.get("show_history_details_for") == chosen:
+        st.json(selected)
+
 
 
 def avatar_library():
@@ -1464,7 +1933,7 @@ def avatar_library():
 
 def reset_generated(job: dict) -> dict:
     job = dict(job)
-    for key in ["flow_product_ref_ids", "ref_signature", "image_status", "image_job_id", "image_media_id", "image_url", "image_encoded", "image_seed", "image_error", "approved", "video_status", "video_job_id", "video_submitted_at", "video_url", "video_media_id", "video_error", "thumbnail_url", "drive_image_id", "drive_image_url", "drive_image_download_url", "drive_image_error", "drive_video_id", "drive_video_url", "drive_video_download_url", "drive_video_error", "drive_batch_folder_url"]:
+    for key in ["flow_product_ref_ids", "ref_signature", "image_status", "image_job_id", "image_media_id", "image_url", "image_encoded", "image_seed", "image_error", "approved", "video_status", "video_job_id", "video_submitted_at", "video_url", "video_media_id", "video_error", "thumbnail_url", "drive_image_id", "drive_image_url", "drive_image_download_url", "drive_image_error", "drive_video_id", "drive_video_url", "drive_video_download_url", "drive_video_error", "drive_batch_folder_url", "drive_product_folder_url", "drive_reference_ids", "drive_reference_urls", "drive_reference_download_urls", "drive_reference_errors"]:
         job.pop(key, None)
     job.update({"image_status": "pending", "approved": False, "video_status": "pending"})
     return job
@@ -1600,7 +2069,7 @@ def render_job_result(job: dict, index: int, token: str, email: str, avatar_id: 
         with img_col:
             st.markdown("<div class='panel-title'>Try-on image</div>", unsafe_allow_html=True)
             st.markdown("<div class='panel-sub'>Nano Banana 2 · portrait 9:16</div>", unsafe_allow_html=True)
-            image_bytes = image_bytes_from_result({"encoded": job.get("image_encoded"), "url": job.get("image_url")}) if job.get("image_status") == "completed" else None
+            image_bytes = image_bytes_for_job(job)[0] if job.get("image_status") == "completed" else None
             if image_bytes:
                 st.image(image_bytes, use_container_width=True)
             elif job.get("image_status") == "failed":
@@ -1615,8 +2084,17 @@ def render_job_result(job: dict, index: int, token: str, email: str, avatar_id: 
                     key=f"approve_{job['id']}",
                 )
                 updated["approved"] = approved_now
+                regen_instruction = st.text_input(
+                    "Regeneration instruction (optional)",
+                    value=str(job.get("regen_instruction") or ""),
+                    placeholder="e.g. Make the shirt looser, keep the logo larger, show the full pants",
+                    key=f"regen_note_{job['id']}",
+                )
+                updated["regen_instruction"] = regen_instruction
                 if st.button("↻ Regenerate image", key=f"regen_img_{job['id']}", use_container_width=True):
-                    with st.spinner("Regenerating try-on image..."):
+                    updated["last_regen_instruction"] = regen_instruction
+                    updated["active_regen_instruction"] = regen_instruction
+                    with st.spinner("Regenerating try-on image with your instruction..."):
                         updated = generate_one_image(updated, token, email, avatar_id, scene)
                     st.session_state["jobs"][index] = updated
                     st.rerun()
@@ -1628,7 +2106,7 @@ def render_job_result(job: dict, index: int, token: str, email: str, avatar_id: 
                 # Never auto-download the MP4 while rendering the page. That was
                 # the source of the long "Opening…"/frozen experience.
                 media_id = job.get("video_media_id") or ""
-                video_url = job.get("video_url") or ""
+                video_url = job.get("video_url") or job.get("drive_video_download_url") or ""
                 cache_key = f"video_bytes_{job['id']}"
                 cached_data = st.session_state.get(cache_key)
 
@@ -1647,6 +2125,8 @@ def render_job_result(job: dict, index: int, token: str, email: str, avatar_id: 
                 if video_url:
                     st.video(video_url)
                     st.link_button("↗ Open / download original MP4", video_url, use_container_width=True)
+                if job.get("drive_video_url"):
+                    st.link_button("☁ Open permanent Drive video", job.get("drive_video_url"), use_container_width=True)
                 elif cached_data:
                     st.video(cached_data, format="video/mp4")
                 else:
@@ -1673,15 +2153,15 @@ def render_job_result(job: dict, index: int, token: str, email: str, avatar_id: 
                     "↓ Prepare download",
                     key=f"prepare_vid_{job['id']}",
                     use_container_width=True,
-                    disabled=not bool(media_id),
+                    disabled=not bool(media_id or job.get("drive_video_id") or video_url),
                 ):
-                    with st.spinner("Fetching MP4…"):
-                        data, message = download_video_raw(token, media_id)
+                    with st.spinner("Fetching MP4 from Flow or the permanent Drive archive…"):
+                        data = download_video_for_job(token, job)
                     if data:
                         st.session_state[cache_key] = data
                         st.rerun()
                     else:
-                        st.warning(message or "MP4 is not ready yet.")
+                        st.warning("MP4 could not be retrieved yet.")
 
                 cached_data = st.session_state.get(cache_key)
                 if cached_data:
@@ -1972,8 +2452,27 @@ def main():
             "Auto-archive completed media to Drive",
             value=bool(drive_archive_cfg.get("auto")),
             disabled=not bool(drive_archive_cfg.get("configured")),
-            help="Uploads each completed generated image/video to your permanent Google Drive archive. Google Sheet exports then use those Drive links too.",
+            help="Uploads selected product references plus each completed try-on/video to your permanent Google Drive archive.",
         )
+        auto_sheet_sync = st.checkbox(
+            "Auto-sync production tracker",
+            value=bool(default_google_sheet_url),
+            disabled=not bool(default_google_sheet_url and get_google_service_account_info()),
+            help="Keeps the Flow Try-On tab and permanent Batch History updated when statuses, approvals, Drive links, or generation usage change.",
+        )
+        if st.session_state.get("last_batch_sync_at"):
+            st.caption(f"Last Sheet sync · {st.session_state.get('last_batch_sync_at')}")
+        if st.session_state.get("batch_sync_error"):
+            st.caption("Sheet sync needs attention — open Results → Google Sheets to retry.")
+        with st.expander("Usage cost rates", expanded=False):
+            try:
+                default_img_rate = float(get_secret("FLOW_IMAGE_COST_USD", "0") or 0)
+                default_vid_rate = float(get_secret("FLOW_VIDEO_COST_USD", "0") or 0)
+            except Exception:
+                default_img_rate = default_vid_rate = 0.0
+            st.session_state["image_cost_rate"] = st.number_input("Image cost per call ($)", min_value=0.0, value=float(st.session_state.get("image_cost_rate", default_img_rate)), step=0.01, format="%.4f")
+            st.session_state["video_cost_rate"] = st.number_input("Video cost per call ($)", min_value=0.0, value=float(st.session_state.get("video_cost_rate", default_vid_rate)), step=0.01, format="%.4f")
+            st.caption("Optional. Set your current provider rates here; usage counts are tracked automatically.")
 
         if st.session_state.get("jobs"):
             st.divider()
@@ -1981,14 +2480,16 @@ def main():
                 st.session_state.pop("jobs", None)
                 st.session_state.pop("videos_zip", None)
                 st.session_state.pop("full_batch_zip", None)
+                st.session_state.pop("batch_id", None)
+                st.session_state.pop("batch_created_at", None)
+                st.session_state.pop("last_batch_sync_fingerprint", None)
                 st.rerun()
 
     avatar_hash = hashlib.sha1(avatar_bytes).hexdigest() if avatar_bytes else ""
     if avatar_hash and st.session_state.get("avatar_hash") != avatar_hash:
         st.session_state["avatar_hash"] = avatar_hash
+        # Upload the new avatar on the next generation request, but do not erase already completed batch history/media.
         st.session_state.pop("avatar_flow_id", None)
-        if st.session_state.get("jobs"):
-            st.session_state["jobs"] = [reset_generated(j) for j in st.session_state["jobs"]]
 
     # ---------------- Main header ----------------
     st.markdown(
@@ -2053,7 +2554,13 @@ def main():
                     done += 1
                     progress.progress(done / len(links), text=f"Imported {done}/{len(links)}")
             by_url = {j["url"]: j for j in imported}
-            st.session_state["jobs"] = [by_url[x] for x in links if x in by_url]
+            new_jobs = [by_url[x] for x in links if x in by_url]
+            ensure_batch_metadata(new_jobs, force_new=True)
+            if auto_archive and drive_archive_cfg.get("configured") and new_jobs:
+                with st.spinner("Archiving selected product references to Drive…"):
+                    new_jobs, _ = archive_completed_jobs(new_jobs, token)
+            st.session_state["jobs"] = new_jobs
+            st.session_state.pop("batch_history_cache", None)
             st.session_state.pop("videos_zip", None)
             st.session_state.pop("full_batch_zip", None)
             if errors:
@@ -2079,15 +2586,22 @@ def main():
     if not jobs:
         with st.container(border=True):
             st.markdown("<div class='panel-title'>Start with your products</div>", unsafe_allow_html=True)
-            st.markdown("<div class='panel-sub'>Import a batch above. Once products are loaded, this workspace changes into Product, Generate, and Results views.</div>", unsafe_allow_html=True)
+            st.markdown("<div class='panel-sub'>Import a new batch above or reopen a saved batch from permanent history below.</div>", unsafe_allow_html=True)
             st.info("No products imported yet.")
+        st.write("")
+        with st.container(border=True):
+            render_batch_history(default_google_sheet_url)
         return
+
+    ensure_batch_metadata(jobs)
+    # On the rerun after any generation/status change, persist the new state automatically.
+    maybe_sync_batch(jobs, default_google_sheet_url, sync_current_tab=auto_sheet_sync)
 
     completed_images = sum(1 for j in jobs if j.get("image_status") == "completed")
     approved = sum(1 for j in jobs if j.get("approved"))
     completed_videos = sum(1 for j in jobs if j.get("video_status") == "completed")
 
-    tabs = st.tabs(["Products", "Generate", "Results"])
+    tabs = st.tabs(["Products", "Generate", "Results", "History"])
 
     # ---------------- Products tab ----------------
     with tabs[0]:
@@ -2122,6 +2636,7 @@ def main():
                 "Video": _status_label(job.get("video_status")),
             })
         st.dataframe(rows, use_container_width=True, hide_index=True)
+        maybe_sync_batch(jobs, default_google_sheet_url, sync_current_tab=auto_sheet_sync)
 
     # ---------------- Generate tab ----------------
     with tabs[1]:
@@ -2129,11 +2644,24 @@ def main():
         st.markdown("<div class='panel-title'>Batch generation</div>", unsafe_allow_html=True)
         st.markdown("<div class='panel-sub'>Run the still-image stage, approve images, then generate motion. Full auto can do both stages in one pass.</div>", unsafe_allow_html=True)
 
-        m1, m2, m3, m4 = st.columns(4)
+        needs_approval = sum(1 for j in jobs if _dashboard_stage(j) == "Needs approval")
+        processing_count = sum(1 for j in jobs if _dashboard_stage(j) == "Processing")
+        failed_count = sum(1 for j in jobs if _dashboard_stage(j) == "Failed")
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
         m1.metric("Products", len(jobs))
-        m2.metric("Images", f"{completed_images}/{len(jobs)}")
-        m3.metric("Approved", f"{approved}/{len(jobs)}")
-        m4.metric("Videos", f"{completed_videos}/{len(jobs)}")
+        m2.metric("Images ready", f"{completed_images}/{len(jobs)}")
+        m3.metric("Needs approval", needs_approval)
+        m4.metric("Videos ready", f"{completed_videos}/{len(jobs)}")
+        m5.metric("Processing", processing_count)
+        m6.metric("Failed", failed_count)
+        usage = batch_usage(jobs)
+        estimated_cost, has_cost_rates = usage_cost_estimate(jobs)
+        u1, u2, u3, u4, u5 = st.columns(5)
+        u1.metric("Image calls", usage["image_calls"])
+        u2.metric("Video calls", usage["video_calls"])
+        u3.metric("Retries", usage["retries"])
+        u4.metric("Generation failures", usage["failures"])
+        u5.metric("Est. cost", f"${estimated_cost:,.2f}" if has_cost_rates else "—")
 
         if not avatar_bytes:
             st.warning("Add an avatar in the left sidebar before generating.")
@@ -2174,6 +2702,55 @@ def main():
                     for j in jobs
                 ),
             )
+            failed_generation = any(str(j.get("image_status") or "").lower() == "failed" or str(j.get("video_status") or "").lower() == "failed" for j in jobs)
+            failed_images_need_avatar = any(str(j.get("image_status") or "").lower() == "failed" for j in jobs)
+            retry_failed = st.button(
+                f"↻ Retry failed only ({failed_count})",
+                use_container_width=True,
+                disabled=not failed_generation or (failed_images_need_avatar and not bool(avatar_bytes)),
+                help="Retries only failed image generations and failed Omni video submissions. Completed products are untouched.",
+            )
+
+        if retry_failed:
+            if any(str(j.get("image_status") or "").lower() == "failed" for j in jobs):
+                if not st.session_state.get("avatar_flow_id"):
+                    with st.spinner("Uploading avatar for failed-image retries…"):
+                        st.session_state["avatar_flow_id"] = flow_upload_asset(token, avatar_bytes, avatar_mime, flow_email)
+                avatar_id = st.session_state["avatar_flow_id"]
+                failed_image_indices = [i for i, j in enumerate(jobs) if str(j.get("image_status") or "").lower() == "failed"]
+                progress = st.progress(0, text="Retrying failed images only…")
+                with ThreadPoolExecutor(max_workers=min(IMAGE_WORKERS, len(failed_image_indices) or 1)) as ex:
+                    futures = {ex.submit(generate_one_image, jobs[i], token, flow_email, avatar_id, scene): i for i in failed_image_indices}
+                    done = 0
+                    for fut in as_completed(futures):
+                        idx = futures[fut]
+                        jobs[idx] = fut.result()
+                        if run_mode == "Full auto" and jobs[idx].get("image_status") == "completed":
+                            jobs[idx]["approved"] = True
+                        done += 1
+                        progress.progress(done / max(1, len(failed_image_indices)), text=f"Retried images {done}/{len(failed_image_indices)}")
+            video_retry_indices = [
+                i for i, j in enumerate(jobs)
+                if str(j.get("video_status") or "").lower() == "failed"
+                and j.get("image_status") == "completed" and (j.get("approved") or run_mode == "Full auto")
+            ]
+            # Full-auto image retries can become new video submissions immediately.
+            if run_mode == "Full auto":
+                for i, j in enumerate(jobs):
+                    if j.get("image_status") == "completed" and j.get("approved") and str(j.get("video_status") or "pending").lower() == "pending" and i not in video_retry_indices:
+                        video_retry_indices.append(i)
+            submitted = []
+            for idx in video_retry_indices:
+                jobs[idx] = submit_one_video(jobs[idx], token, flow_email)
+                if jobs[idx].get("video_job_id") and jobs[idx].get("video_status") != "failed":
+                    submitted.append(idx)
+            if auto_archive and drive_archive_cfg.get("configured"):
+                jobs, _ = archive_completed_jobs(jobs, token)
+            st.session_state["jobs"] = jobs
+            remember_video_job_ids(jobs)
+            maybe_sync_batch(jobs, default_google_sheet_url, sync_current_tab=auto_sheet_sync, force=True)
+            st.session_state["retry_notice"] = f"Retried failed items only · {len(video_retry_indices)} video submission(s)."
+            st.rerun()
 
         if generate_images or run_full:
             if not st.session_state.get("avatar_flow_id"):
@@ -2199,9 +2776,8 @@ def main():
                 jobs[idx] = update
             if auto_archive and drive_archive_cfg.get("configured"):
                 jobs, _ = archive_completed_jobs(jobs, token)
-                if default_google_sheet_url:
-                    push_jobs_to_google_sheet(jobs, default_google_sheet_url, "Flow Try-On", "Replace tab")
             st.session_state["jobs"] = jobs
+            maybe_sync_batch(jobs, default_google_sheet_url, sync_current_tab=auto_sheet_sync, force=True)
 
             if run_full or run_mode == "Full auto":
                 submitted = []
@@ -2249,6 +2825,8 @@ def main():
 
         if st.session_state.pop("video_batch_notice", None):
             st.success("Videos queued. You can keep using the app while they generate — this panel checks them automatically.")
+        if st.session_state.pop("retry_notice", None):
+            st.success("Failed-only retry completed/submitted. Completed products were left untouched.")
 
         # Non-blocking live monitor. Streamlit reruns only this small fragment every 12s
         # while any Omni job is active, instead of freezing the whole page for up to 10 minutes.
@@ -2278,10 +2856,8 @@ def main():
                 )
                 if newly_complete:
                     current, _archive_report = archive_completed_jobs(current, token)
-                    # Keep the connected Sheet fresh with permanent Drive links.
-                    if default_google_sheet_url:
-                        push_jobs_to_google_sheet(current, default_google_sheet_url, "Flow Try-On", "Replace tab")
             st.session_state["jobs"] = current
+            maybe_sync_batch(current, default_google_sheet_url, sync_current_tab=auto_sheet_sync)
 
             active_rows = []
             now = time.time()
@@ -2312,14 +2888,25 @@ def main():
 
         _live_omni_monitor()
 
+        st.markdown("<div class='panel-title'>Production dashboard</div>", unsafe_allow_html=True)
+        dashboard_filter = st.selectbox("Show", ["All", "Ready", "Processing", "Failed", "Needs approval", "Ready for video", "Pending"], key="dashboard_filter")
         status_rows = []
-        for i, job in enumerate(jobs, 1):
+        for i, job in enumerate(st.session_state.get("jobs") or jobs, 1):
+            stage = _dashboard_stage(job)
+            if dashboard_filter != "All" and stage != dashboard_filter:
+                continue
+            image_calls, video_calls, retries, failures = _job_usage(job)
             status_rows.append({
                 "#": i,
-                "Product": _short_title(job.get("name"), 55),
+                "Product": _short_title(job.get("name"), 48),
+                "Stage": stage,
                 "Image": _status_label(job.get("image_status")),
                 "Approved": "Yes" if job.get("approved") else "No",
                 "Video": _status_label(job.get("video_status")),
+                "Drive": "Archived" if job.get("drive_image_id") and (job.get("video_status") != "completed" or job.get("drive_video_id")) else "Pending",
+                "Calls": f"{image_calls} img / {video_calls} vid",
+                "Retries": retries,
+                "Error": job.get("video_error") or job.get("image_error") or "",
             })
         st.dataframe(status_rows, use_container_width=True, hide_index=True)
 
@@ -2347,9 +2934,8 @@ def main():
             or (updated.get("video_status") == "completed" and not updated.get("drive_video_id"))
         ):
             jobs, _ = archive_completed_jobs(jobs, token)
-            if default_google_sheet_url:
-                push_jobs_to_google_sheet(jobs, default_google_sheet_url, "Flow Try-On", "Replace tab")
         st.session_state["jobs"] = jobs
+        maybe_sync_batch(jobs, default_google_sheet_url, sync_current_tab=auto_sheet_sync)
 
         st.write("")
         with st.container(border=True):
@@ -2403,26 +2989,30 @@ def main():
             st.divider()
             st.markdown("<div class='panel-title'>Permanent Google Drive archive</div>", unsafe_allow_html=True)
             st.markdown("<div class='panel-sub'>Copies completed try-on images and MP4s into your own Google Drive so they do not depend on expiring Flow/CDN links. Existing filenames are reused instead of duplicated.</div>", unsafe_allow_html=True)
+            archived_refs = sum(len([x for x in (j.get("drive_reference_ids") or []) if x]) for j in jobs)
+            total_refs = sum(len(j.get("selected_refs") or []) for j in jobs)
             archived_images = sum(1 for j in jobs if j.get("drive_image_id"))
             archived_videos = sum(1 for j in jobs if j.get("drive_video_id"))
             completed_media = sum(1 for j in jobs if j.get("image_status") == "completed") + sum(1 for j in jobs if j.get("video_status") == "completed")
-            archived_media = archived_images + archived_videos
-            d1, d2, d3 = st.columns([1, 1, 2])
-            d1.metric("Drive images", archived_images)
-            d2.metric("Drive videos", archived_videos)
-            folder_url = next((j.get("drive_batch_folder_url") for j in jobs if j.get("drive_batch_folder_url")), "")
+            archivable_total = total_refs + completed_media
+            archived_media = archived_refs + archived_images + archived_videos
+            d1, d2, d3, d4 = st.columns([1, 1, 1, 2])
+            d1.metric("References", f"{archived_refs}/{total_refs}")
+            d2.metric("Drive images", archived_images)
+            d3.metric("Drive videos", archived_videos)
+            folder_url = next((j.get("drive_product_folder_url") or j.get("drive_batch_folder_url") for j in jobs if j.get("drive_product_folder_url") or j.get("drive_batch_folder_url")), "")
             if folder_url:
-                d3.link_button("Open batch folder in Google Drive", folder_url, use_container_width=True)
+                d4.link_button("Open first product folder in Google Drive", folder_url, use_container_width=True)
             elif drive_archive_cfg.get("configured"):
-                d3.caption(f"{archived_media}/{completed_media} completed media files archived")
+                d4.caption(f"{archived_media}/{archivable_total} reference/generated files archived")
             else:
-                d3.caption("Drive archive is not configured yet.")
+                d4.caption("Drive archive is not configured yet.")
 
             if st.button(
-                "☁ Archive completed media now",
+                "☁ Archive references + completed media now",
                 type="primary",
                 use_container_width=True,
-                disabled=not bool(drive_archive_cfg.get("configured")) or completed_media == 0,
+                disabled=not bool(drive_archive_cfg.get("configured")) or archivable_total == 0,
             ):
                 bar = st.progress(0, text="Preparing Google Drive archive…")
                 def _archive_progress(done, total, kind, job):
@@ -2433,11 +3023,11 @@ def main():
                     st.session_state["jobs"] = jobs
                     sheet_message = ""
                     if default_google_sheet_url:
-                        ok_sheet, sheet_message = push_jobs_to_google_sheet(jobs, default_google_sheet_url, "Flow Try-On", "Replace tab")
+                        ok_sheet, sheet_message = maybe_sync_batch(jobs, default_google_sheet_url, sync_current_tab=auto_sheet_sync, force=True)
                 if archive_report.get("failed"):
                     st.warning(f"Drive archive: {archive_report.get('uploaded', 0)} uploaded, {archive_report.get('existing', 0)} already existed, {archive_report.get('failed', 0)} failed. " + (archive_report.get("errors") or [""])[0])
                 else:
-                    st.success(f"Drive archive ready · {archive_report.get('uploaded', 0)} new file(s), {archive_report.get('existing', 0)} already archived." + (" Google Sheet updated with permanent Drive links." if default_google_sheet_url else ""))
+                    st.success(f"Drive archive ready · {archive_report.get('references', 0)} reference(s), {archive_report.get('images', 0)} try-on(s), {archive_report.get('videos', 0)} video(s) processed · {archive_report.get('uploaded', 0)} new file(s), {archive_report.get('existing', 0)} already archived." + (" Google Sheet/history updated." if default_google_sheet_url else ""))
                 st.rerun()
 
             st.divider()
@@ -2462,10 +3052,19 @@ def main():
             if st.button("↗ Push batch to Google Sheet", use_container_width=True, disabled=not bool(sheet_url)):
                 with st.spinner("Updating Google Sheet…"):
                     ok, message = push_jobs_to_google_sheet(jobs, sheet_url, tab_name, push_mode)
+                    if ok:
+                        persist_batch_history_to_google_sheet(jobs, sheet_url)
+                        st.session_state.pop("batch_history_cache", None)
                 if ok:
-                    st.success(message)
+                    st.success(message + " Batch History updated.")
                 else:
                     st.error(message)
+
+    # ---------------- History tab ----------------
+    with tabs[3]:
+        st.write("")
+        render_batch_history(default_google_sheet_url)
+
 
 
 if __name__ == "__main__":
