@@ -1252,6 +1252,147 @@ def archive_completed_jobs(jobs: list[dict], token: str, progress_callback=None)
     return current, report
 
 
+def _sheet_hyperlink(url: str, label: str) -> str:
+    """Return a Google Sheets HYPERLINK formula while safely escaping quotes."""
+    url = str(url or "").strip()
+    if not url:
+        return ""
+    safe_url = url.replace('"', '""')
+    safe_label = str(label or "Open").replace('"', '""')
+    return f'=HYPERLINK("{safe_url}","{safe_label}")'
+
+
+def _jobs_sheet_rows(jobs: list[dict]) -> tuple[list[str], list[list[str]]]:
+    """Same export schema as CSV, but replace long URLs with friendly clickable labels."""
+    headers, rows = jobs_export_rows(jobs)
+    polished = []
+    for row in rows:
+        r = list(row)
+        # Keep the underlying URL in the hyperlink while showing a short readable label.
+        r[2] = _sheet_hyperlink(r[2], "Open product")
+        r[10] = _sheet_hyperlink(r[10], "View image")
+        r[16] = _sheet_hyperlink(r[16], "View video")
+        r[18] = _sheet_hyperlink(r[18], "Open archive")
+        polished.append(r)
+    return headers, polished
+
+
+def _format_google_sheet(book, ws, headers: list[str], data_rows: int) -> None:
+    """Apply a compact human-friendly layout while preserving hidden technical metadata."""
+    sheet_id = ws.id
+    total_cols = len(headers)
+    total_rows = max(2, data_rows + 1)
+
+    # 0-based widths keyed by column index.
+    widths = {
+        0: 58,   # Product #
+        1: 290,  # Product name
+        2: 112,  # Product link
+        3: 145,  # Product ID (hidden)
+        4: 105,  # Try-on focus
+        5: 92,   # Back design
+        6: 108,  # Image status
+        7: 88,   # Approved
+        8: 180,  # Image URL (hidden)
+        9: 160,  # Image media ID (hidden)
+        10: 108, # Drive image
+        11: 155, # Drive image ID (hidden)
+        12: 108, # Video status
+        13: 180, # Video URL (hidden)
+        14: 160, # Video media ID (hidden)
+        15: 210, # Video job ID (hidden)
+        16: 108, # Drive video
+        17: 155, # Drive video ID (hidden)
+        18: 118, # Archive folder
+        19: 280, # Selected refs (hidden)
+    }
+    hidden_cols = {3, 8, 9, 11, 13, 14, 15, 17, 19}
+
+    requests_payload = [
+        {
+            "updateSheetProperties": {
+                "properties": {
+                    "sheetId": sheet_id,
+                    "gridProperties": {"frozenRowCount": 1, "frozenColumnCount": 2},
+                },
+                "fields": "gridProperties.frozenRowCount,gridProperties.frozenColumnCount",
+            }
+        },
+        {
+            "repeatCell": {
+                "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": total_cols},
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": {"red": 0.075, "green": 0.094, "blue": 0.133},
+                        "textFormat": {"bold": True, "foregroundColor": {"red": 1, "green": 1, "blue": 1}, "fontSize": 10},
+                        "verticalAlignment": "MIDDLE",
+                        "wrapStrategy": "WRAP",
+                    }
+                },
+                "fields": "userEnteredFormat(backgroundColor,textFormat,verticalAlignment,wrapStrategy)",
+            }
+        },
+        {
+            "repeatCell": {
+                "range": {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": total_rows, "startColumnIndex": 0, "endColumnIndex": total_cols},
+                "cell": {"userEnteredFormat": {"verticalAlignment": "MIDDLE", "wrapStrategy": "WRAP"}},
+                "fields": "userEnteredFormat(verticalAlignment,wrapStrategy)",
+            }
+        },
+        {
+            "repeatCell": {
+                "range": {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": total_rows, "startColumnIndex": 0, "endColumnIndex": 1},
+                "cell": {"userEnteredFormat": {"horizontalAlignment": "CENTER"}},
+                "fields": "userEnteredFormat.horizontalAlignment",
+            }
+        },
+        {
+            "repeatCell": {
+                "range": {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": total_rows, "startColumnIndex": 4, "endColumnIndex": 8},
+                "cell": {"userEnteredFormat": {"horizontalAlignment": "CENTER"}},
+                "fields": "userEnteredFormat.horizontalAlignment",
+            }
+        },
+        {
+            "repeatCell": {
+                "range": {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": total_rows, "startColumnIndex": 12, "endColumnIndex": 13},
+                "cell": {"userEnteredFormat": {"horizontalAlignment": "CENTER"}},
+                "fields": "userEnteredFormat.horizontalAlignment",
+            }
+        },
+        {
+            "updateDimensionProperties": {
+                "range": {"sheetId": sheet_id, "dimension": "ROWS", "startIndex": 0, "endIndex": 1},
+                "properties": {"pixelSize": 42},
+                "fields": "pixelSize",
+            }
+        },
+        {
+            "updateDimensionProperties": {
+                "range": {"sheetId": sheet_id, "dimension": "ROWS", "startIndex": 1, "endIndex": total_rows},
+                "properties": {"pixelSize": 48},
+                "fields": "pixelSize",
+            }
+        },
+        {
+            "setBasicFilter": {
+                "filter": {"range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": total_rows, "startColumnIndex": 0, "endColumnIndex": total_cols}}
+            }
+        },
+    ]
+
+    for idx in range(total_cols):
+        requests_payload.append({
+            "updateDimensionProperties": {
+                "range": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": idx, "endIndex": idx + 1},
+                "properties": {"pixelSize": widths.get(idx, 120), "hiddenByUser": idx in hidden_cols},
+                "fields": "pixelSize,hiddenByUser",
+            }
+        })
+
+    book.batch_update({"requests": requests_payload})
+
+
 def push_jobs_to_google_sheet(jobs: list[dict], spreadsheet_url: str, worksheet_name: str, mode: str = "Replace tab") -> tuple[bool, str]:
     """Push the current batch to Google Sheets using a service account."""
     info = get_google_service_account_info()
@@ -1266,7 +1407,7 @@ def push_jobs_to_google_sheet(jobs: list[dict], spreadsheet_url: str, worksheet_
     if not sheet_ref:
         return False, "Paste a Google Sheet URL first."
     tab_name = (str(worksheet_name or "Flow Try-On").strip() or "Flow Try-On")[:100]
-    headers, rows = jobs_export_rows(jobs)
+    headers, rows = _jobs_sheet_rows(jobs)
     values = [headers] + rows
     try:
         gc = gspread.service_account_from_dict(info)
@@ -1285,12 +1426,21 @@ def push_jobs_to_google_sheet(jobs: list[dict], spreadsheet_url: str, worksheet_
                 ws.update(range_name="A1", values=[headers])
             if rows:
                 ws.append_rows(rows, value_input_option="USER_ENTERED", insert_data_option="INSERT_ROWS")
+            final_row_count = max(len(existing), 1) + len(rows)
         else:
             ws.clear()
             ws.update(range_name="A1", values=values, value_input_option="USER_ENTERED")
+            final_row_count = len(rows) + 1
+
+        # Formatting is best-effort: a data push should still succeed even if Google rejects a visual setting.
+        format_warning = ""
+        try:
+            _format_google_sheet(book, ws, headers, max(0, final_row_count - 1))
+        except Exception as fmt_exc:
+            format_warning = f" Data was saved, but Sheet formatting could not be applied: {fmt_exc}"
 
         service_email = str(info.get("client_email") or "service account")
-        return True, f"Pushed {len(rows)} product(s) to '{tab_name}'. Connected as {service_email}."
+        return True, f"Pushed {len(rows)} product(s) to '{tab_name}' and formatted it for easier reading. Connected as {service_email}.{format_warning}"
     except Exception as exc:
         return False, f"Google Sheets push failed: {exc}"
 
@@ -2292,7 +2442,7 @@ def main():
 
             st.divider()
             st.markdown("<div class='panel-title'>Google Sheets</div>", unsafe_allow_html=True)
-            st.markdown("<div class='panel-sub'>Push the same export rows to a Google Sheet. Share the Sheet with your service-account email as Editor once, then the app can update it without a Google sign-in.</div>", unsafe_allow_html=True)
+            st.markdown("<div class='panel-sub'>Push a clean, formatted batch view to Google Sheets. Headers are frozen, filters are added, long URLs become clickable labels, and technical IDs stay available but hidden by default.</div>", unsafe_allow_html=True)
             gs1, gs2 = st.columns([2, 1])
             sheet_url = gs1.text_input(
                 "Google Sheet URL",
