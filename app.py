@@ -230,7 +230,28 @@ def inject_css():
         html, body, [class*="css"] { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
         .stApp { background:#070b12; color:#f8fafc; }
         [data-testid="stAppViewContainer"] { background:linear-gradient(180deg,#080d17 0%,#070b12 100%); }
-        .block-container { max-width:1280px; padding-top:2rem; padding-bottom:5rem; }
+        .block-container { max-width:1280px; padding-top:2rem; padding-bottom:10rem; }
+
+        /* R12.1 scroll safety — Streamlit Cloud can occasionally leave the main pane
+           height-constrained after sidebar/image rerenders. Make the app shell fixed to
+           the viewport and give the main/sidebar panes their own explicit scrolling. */
+        html, body, #root { height:100% !important; min-height:100% !important; }
+        [data-testid="stAppViewContainer"] { height:100vh !important; min-height:100vh !important; overflow:hidden !important; }
+        [data-testid="stMain"] {
+            height:100vh !important;
+            min-height:0 !important;
+            overflow-y:auto !important;
+            overflow-x:hidden !important;
+            -webkit-overflow-scrolling:touch !important;
+            overscroll-behavior-y:contain;
+            scrollbar-gutter:stable;
+        }
+        [data-testid="stMainBlockContainer"], .block-container {
+            min-height:max-content !important;
+            overflow:visible !important;
+        }
+        section[data-testid="stSidebar"] { height:100vh !important; overflow-y:auto !important; }
+        section[data-testid="stSidebar"] > div { min-height:max-content !important; }
 
         /* Sidebar */
         section[data-testid="stSidebar"] { background:#0b111c; border-right:1px solid #1c2636; }
@@ -312,6 +333,8 @@ def inject_css():
 
         /* Images */
         [data-testid="stImage"] img { border-radius:14px; border:1px solid #1d293a; }
+        /* Keep reference galleries compact; object-fit preserves the whole garment. */
+        [data-testid="stHorizontalBlock"] [data-testid="column"] [data-testid="stImage"] img { max-height:300px !important; object-fit:contain !important; background:#0b1523; }
 
         /* Dataframe */
         [data-testid="stDataFrame"] { border:1px solid #1b2637; border-radius:14px; overflow:hidden; }
