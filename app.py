@@ -629,6 +629,7 @@ def generate_one_image(job: dict, token: str, email: str, avatar_id: str, scene:
             "approved": False,
             "video_status": "pending",
             "video_job_id": None,
+            "video_submitted_at": None,
             "video_url": None,
             "video_media_id": None,
             "video_error": None,
@@ -650,6 +651,7 @@ def submit_one_video(job: dict, token: str, email: str) -> dict:
         updated.update({
             "video_job_id": result["job_id"],
             "video_status": result.get("status") or "created",
+            "video_submitted_at": time.time(),
             "video_url": None,
             "video_media_id": None,
             "video_error": None,
@@ -788,7 +790,7 @@ def avatar_library():
 
 def reset_generated(job: dict) -> dict:
     job = dict(job)
-    for key in ["flow_product_ref_ids", "ref_signature", "image_status", "image_job_id", "image_media_id", "image_url", "image_encoded", "image_seed", "image_error", "approved", "video_status", "video_job_id", "video_url", "video_media_id", "video_error", "thumbnail_url"]:
+    for key in ["flow_product_ref_ids", "ref_signature", "image_status", "image_job_id", "image_media_id", "image_url", "image_encoded", "image_seed", "image_error", "approved", "video_status", "video_job_id", "video_submitted_at", "video_url", "video_media_id", "video_error", "thumbnail_url"]:
         job.pop(key, None)
     job.update({"image_status": "pending", "approved": False, "video_status": "pending"})
     return job
@@ -944,27 +946,18 @@ def render_job_result(job: dict, index: int, token: str, email: str, avatar_id: 
                 st.info("Approve the image, then generate its video.")
 
             b1, b2 = st.columns(2)
+            active_video = bool(job.get("video_job_id")) and str(job.get("video_status") or "").lower() not in {"failed"}
             if b1.button(
                 "▶ Generate video",
                 key=f"gen_vid_{job['id']}",
                 use_container_width=True,
-                disabled=not bool(job.get("image_media_id")),
+                disabled=(not bool(job.get("image_media_id"))) or active_video,
             ):
-                status_box = st.status("Submitting Omni 1.1 Flash…", expanded=True)
-                updated = submit_one_video(updated, token, email)
+                with st.spinner("Submitting Omni 1.1 Flash…"):
+                    updated = submit_one_video(updated, token, email)
                 st.session_state["jobs"][index] = updated
                 if updated.get("video_job_id") and updated.get("video_status") != "failed":
-                    status_box.write("Video queued. Waiting for Google Flow to finish…")
-                    def _show_poll(status, elapsed):
-                        status_box.update(label=f"Generating video · {_status_label(status)} · {elapsed}s", state="running")
-                    updated = wait_for_video(updated, token, progress_callback=_show_poll)
-                    st.session_state["jobs"][index] = updated
-                    if updated.get("video_status") == "completed":
-                        status_box.update(label="Video ready", state="complete", expanded=False)
-                    elif updated.get("video_status") == "failed":
-                        status_box.update(label="Video generation failed", state="error", expanded=True)
-                    else:
-                        status_box.update(label="Video is still generating", state="running", expanded=True)
+                    st.toast("Video queued. Status will update automatically.")
                 st.rerun()
             if b2.button(
                 "↻ Check status",
@@ -1225,7 +1218,11 @@ def main():
             generate_approved = b2.button(
                 "Generate videos for approved",
                 use_container_width=True,
-                disabled=not any(j.get("approved") and j.get("image_media_id") for j in jobs),
+                disabled=not any(
+                    j.get("approved") and j.get("image_media_id")
+                    and str(j.get("video_status") or "pending").lower() not in {"created", "started", "completed"}
+                    for j in jobs
+                ),
             )
 
         if generate_images or run_full:
@@ -1262,12 +1259,7 @@ def main():
                             submitted.append(i)
                 st.session_state["jobs"] = jobs
                 if submitted:
-                    video_bar = st.progress(0, text=f"Omni 1.1 videos queued · 0/{len(submitted)} ready")
-                    def _batch_progress(done, total, elapsed, current_jobs):
-                        video_bar.progress(done / max(1, total), text=f"Waiting for Omni 1.1 · {done}/{total} finished · {elapsed}s")
-                        st.session_state["jobs"] = current_jobs
-                    jobs = wait_for_video_batch(jobs, token, submitted, progress_callback=_batch_progress)
-                    st.session_state["jobs"] = jobs
+                    st.session_state["video_batch_notice"] = f"Queued {len(submitted)} Omni 1.1 video job(s). They will update automatically."
             st.rerun()
 
         if refresh_all:
@@ -1289,19 +1281,69 @@ def main():
         if generate_approved:
             submitted = []
             for i, job in enumerate(jobs):
-                if job.get("approved") and job.get("image_media_id"):
+                status = str(job.get("video_status") or "pending").lower()
+                if job.get("approved") and job.get("image_media_id") and status not in {"created", "started", "completed"}:
                     jobs[i] = submit_one_video(job, token, flow_email)
                     if jobs[i].get("video_job_id") and jobs[i].get("video_status") != "failed":
                         submitted.append(i)
             st.session_state["jobs"] = jobs
             if submitted:
-                video_bar = st.progress(0, text=f"Omni 1.1 videos queued · 0/{len(submitted)} ready")
-                def _batch_progress(done, total, elapsed, current_jobs):
-                    video_bar.progress(done / max(1, total), text=f"Waiting for Omni 1.1 · {done}/{total} finished · {elapsed}s")
-                    st.session_state["jobs"] = current_jobs
-                jobs = wait_for_video_batch(jobs, token, submitted, progress_callback=_batch_progress)
-                st.session_state["jobs"] = jobs
+                st.session_state["video_batch_notice"] = f"Queued {len(submitted)} Omni 1.1 video job(s). They will update automatically."
             st.rerun()
+
+        if st.session_state.pop("video_batch_notice", None):
+            st.success("Videos queued. You can keep using the app while they generate — this panel checks them automatically.")
+
+        # Non-blocking live monitor. Streamlit reruns only this small fragment every 12s
+        # while any Omni job is active, instead of freezing the whole page for up to 10 minutes.
+        _has_pending_video = any(
+            j.get("video_job_id") and str(j.get("video_status") or "").lower() not in {"completed", "failed"}
+            for j in st.session_state.get("jobs", [])
+        )
+        _video_poll_every = 12 if _has_pending_video else None
+
+        @st.fragment(run_every=_video_poll_every)
+        def _live_omni_monitor():
+            current = [dict(j) for j in st.session_state.get("jobs", [])]
+            pending = [
+                i for i, j in enumerate(current)
+                if j.get("video_job_id") and str(j.get("video_status") or "").lower() not in {"completed", "failed"}
+            ]
+            if not pending:
+                return
+
+            for idx in pending:
+                current[idx] = refresh_one_video(current[idx], token)
+            st.session_state["jobs"] = current
+
+            active_rows = []
+            now = time.time()
+            for idx, j in enumerate(current, 1):
+                if not j.get("video_job_id"):
+                    continue
+                submitted_at = j.get("video_submitted_at")
+                elapsed = int(now - submitted_at) if submitted_at else None
+                active_rows.append({
+                    "#": idx,
+                    "Product": _short_title(j.get("name"), 46),
+                    "Omni status": _status_label(j.get("video_status")),
+                    "Elapsed": f"{elapsed}s" if elapsed is not None else "—",
+                    "Error": j.get("video_error") or "",
+                })
+
+            ready = sum(1 for j in current if str(j.get("video_status") or "").lower() == "completed")
+            failed = sum(1 for j in current if str(j.get("video_status") or "").lower() == "failed")
+            still = sum(1 for j in current if j.get("video_job_id") and str(j.get("video_status") or "").lower() not in {"completed", "failed"})
+
+            st.markdown("<div class='panel-title'>Live Omni 1.1 status</div>", unsafe_allow_html=True)
+            st.caption(f"{ready} ready · {still} processing/queued · {failed} failed · auto-checks every 12 seconds")
+            if active_rows:
+                st.dataframe(active_rows, use_container_width=True, hide_index=True)
+
+            if still == 0:
+                st.rerun()
+
+        _live_omni_monitor()
 
         status_rows = []
         for i, job in enumerate(jobs, 1):
