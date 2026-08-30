@@ -140,7 +140,60 @@ def inject_css():
         /* Dataframe */
         [data-testid="stDataFrame"] { border:1px solid #1b2637; border-radius:14px; overflow:hidden; }
 
-        hr { border-color:#192334 !important; }
+        hr { border-color:#26354a !important; }
+
+        /* R5 high-contrast overrides — keep every control readable */
+        .stApp, [data-testid="stAppViewContainer"] { color:#eef4ff !important; }
+        [data-testid="stAppViewContainer"] { background:linear-gradient(180deg,#08111f 0%,#07101b 52%,#060d17 100%) !important; }
+        section[data-testid="stSidebar"] { background:#0b1625 !important; border-right:1px solid #26364c !important; }
+        section[data-testid="stSidebar"] p,
+        section[data-testid="stSidebar"] label,
+        section[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p { color:#d7e1ef !important; }
+        section[data-testid="stSidebar"] [data-testid="stCaptionContainer"] p { color:#9cabc0 !important; }
+        .connection-row { background:#101d2d !important; border-color:#26364c !important; }
+        .connection-row > span:last-child { color:#a9b8cb !important; }
+        .section-label { color:#9aacc2 !important; }
+
+        .app-kicker { color:#9caec4 !important; }
+        .app-subtitle, .panel-sub { color:#a9b7ca !important; }
+        .top-pill { background:#122033 !important; border-color:#2b3c55 !important; color:#d0dbea !important; }
+        .product-id { color:#9badc3 !important; }
+        [data-testid="stWidgetLabel"] p, [data-testid="stWidgetLabel"] span { color:#dbe5f2 !important; }
+        [data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] p { color:#a8b6c9 !important; }
+        .stMarkdown p { color:#c3cfde !important; }
+        a { color:#72b8ff !important; }
+
+        /* Expander headers were rendering as a white bar on Streamlit Cloud */
+        [data-testid="stExpander"] details { background:#0b1523 !important; border:1px solid #27384f !important; border-radius:16px !important; overflow:hidden; }
+        [data-testid="stExpander"] summary { background:#101d2d !important; color:#f5f8fc !important; min-height:50px !important; padding:0 16px !important; }
+        [data-testid="stExpander"] summary:hover { background:#14243a !important; }
+        [data-testid="stExpander"] summary p, [data-testid="stExpander"] summary span { color:#f5f8fc !important; font-weight:750 !important; }
+        [data-testid="stExpander"] summary svg { fill:#c9d7e8 !important; color:#c9d7e8 !important; }
+
+        /* Inputs and selectors */
+        .stTextInput input, .stTextArea textarea, .stNumberInput input {
+            background:#101c2b !important; color:#f7faff !important; border:1px solid #40516a !important;
+        }
+        .stTextInput input::placeholder, .stTextArea textarea::placeholder { color:#8292a8 !important; opacity:1 !important; }
+        div[data-baseweb="select"] > div { background:#101c2b !important; border-color:#40516a !important; }
+        div[data-baseweb="select"] span, div[data-baseweb="select"] input { color:#f7faff !important; }
+        .stRadio label, .stRadio label p, .stRadio label span, .stCheckbox label, .stCheckbox label p, .stCheckbox label span { color:#dbe5f2 !important; }
+
+        /* Uploader and buttons */
+        .stFileUploader section { background:#0f1b2a !important; border-color:#3b516e !important; }
+        .stFileUploader section *, [data-testid="stFileUploader"] small { color:#c4d0df !important; }
+        [data-testid="stFileUploader"] button { background:#17263a !important; color:#f4f8ff !important; border:1px solid #405675 !important; }
+        div.stButton > button, div.stDownloadButton > button { background:#152236 !important; color:#eef4ff !important; border-color:#364b68 !important; }
+        div.stButton > button:hover, div.stDownloadButton > button:hover { background:#1b2d46 !important; border-color:#6883a9 !important; color:#ffffff !important; }
+        div.stButton > button:disabled, div.stDownloadButton > button:disabled { background:#0e1826 !important; color:#70839d !important; border-color:#24344a !important; }
+        div.stButton > button[kind="primary"] { background:linear-gradient(90deg,#3f82ff,#7658ff) !important; color:#ffffff !important; border:0 !important; }
+
+        /* Cards, metrics, alerts */
+        div[data-testid="stVerticalBlockBorderWrapper"] { background:#0b1523 !important; border-color:#26374d !important; }
+        div[data-testid="stMetric"] { background:#101d2d !important; border-color:#2b3d56 !important; }
+        div[data-testid="stMetricLabel"] p { color:#a8b7ca !important; }
+        div[data-testid="stMetricValue"] { color:#ffffff !important; }
+        [data-testid="stAlert"] p, [data-testid="stAlert"] span { color:#e4ecf7 !important; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -306,6 +359,32 @@ def flow_submit_video(token: str, email: str, image_media_id: str, prompt: str) 
 
 def flow_get_job(token: str, job_id: str) -> dict:
     return request_json("GET", f"{FLOW_BASE}/jobs/{quote(job_id, safe='')}", headers=flow_headers(token), timeout=60, retries=1)
+
+
+def flow_jobs_overview(token: str, options: str = "history") -> dict:
+    """Return Flow job activity. history includes executing + last 10 completed jobs from ~15 minutes."""
+    return request_json(
+        "GET",
+        f"{FLOW_BASE}/jobs/",
+        headers=flow_headers(token),
+        params={"options": options},
+        timeout=60,
+        retries=1,
+    )
+
+
+def remember_video_job_ids(jobs: list[dict]) -> None:
+    """Keep submitted job IDs in the browser URL so a Streamlit redeploy can recover them."""
+    ids = []
+    for job in jobs:
+        jid = str(job.get("video_job_id") or "").strip()
+        if jid and jid not in ids:
+            ids.append(jid)
+    if ids:
+        try:
+            st.query_params["flow_jobs"] = ",".join(ids[-10:])
+        except Exception:
+            pass
 
 
 def flow_resolve_asset_url(token: str, media_id: str) -> str:
@@ -1016,6 +1095,7 @@ def render_job_result(job: dict, index: int, token: str, email: str, avatar_id: 
                 with st.spinner("Submitting Omni 1.1 Flash…"):
                     updated = submit_one_video(updated, token, email)
                 st.session_state["jobs"][index] = updated
+                remember_video_job_ids(st.session_state.get("jobs") or [])
                 if updated.get("video_job_id") and updated.get("video_status") != "failed":
                     st.toast("Video queued. Status will update automatically.")
                 st.rerun()
@@ -1030,6 +1110,172 @@ def render_job_result(job: dict, index: int, token: str, email: str, avatar_id: 
                 st.session_state["jobs"][index] = updated
                 st.rerun()
     return updated
+
+
+def _video_media_from_job(payload: dict) -> tuple[str, str, str]:
+    response = payload.get("response") or {}
+    media = response.get("media") or []
+    if not media:
+        return "", "", ""
+    item = media[0] or {}
+    return (
+        str(item.get("mediaGenerationId") or ""),
+        str(item.get("videoUrl") or ""),
+        str(item.get("thumbnailUrl") or ""),
+    )
+
+
+def render_flow_recovery(token: str, expanded: bool = False) -> None:
+    """Visible recovery UI for Flow jobs independent of the current product batch."""
+    with st.expander("Recover existing Flow videos", expanded=expanded):
+        st.markdown("<div class='panel-title'>Recover Flow jobs</div>", unsafe_allow_html=True)
+        st.markdown(
+            "<div class='panel-sub'>Recent discovery covers roughly the last 15 minutes. If you already have a job ID, direct lookup works for jobs retained by useapi (currently up to 7 days).</div>",
+            unsafe_allow_html=True,
+        )
+
+        q_ids = []
+        try:
+            raw_q = st.query_params.get("flow_jobs", "")
+            if isinstance(raw_q, list):
+                raw_q = raw_q[-1] if raw_q else ""
+            q_ids = [x.strip() for x in str(raw_q).split(",") if x.strip()]
+        except Exception:
+            pass
+
+        if q_ids and not st.session_state.get("recovery_job_ids"):
+            st.session_state["recovery_job_ids"] = q_ids
+
+        c1, c2 = st.columns([1, 2])
+        if c1.button("Find recent Flow jobs", use_container_width=True, key="find_recent_flow_jobs"):
+            try:
+                overview = flow_jobs_overview(token, "history")
+                ids = []
+                for kind in ("videos", "images"):
+                    group = overview.get(kind) or {}
+                    for bucket in ("executing", "history"):
+                        for jid in (group.get(bucket) or {}).keys():
+                            if jid not in ids:
+                                ids.append(jid)
+                st.session_state["recovery_job_ids"] = ids[:20]
+                st.session_state["recovery_overview"] = overview
+                st.success(f"Found {len(ids)} recent/executing Flow job(s).")
+            except Exception as exc:
+                st.error(f"Could not load recent Flow jobs: {exc}")
+
+        with c2:
+            manual = st.text_input(
+                "Job ID lookup",
+                value="",
+                placeholder="Paste a Flow job ID here (j...)",
+                key="manual_recovery_job_id",
+            )
+        if st.button("Add job ID", use_container_width=True, disabled=not bool(manual.strip()), key="add_recovery_job_id"):
+            ids = list(st.session_state.get("recovery_job_ids") or [])
+            jid = manual.strip()
+            if jid not in ids:
+                ids.insert(0, jid)
+            st.session_state["recovery_job_ids"] = ids[:20]
+            st.rerun()
+
+        ids = list(st.session_state.get("recovery_job_ids") or [])
+        if not ids:
+            st.info("No saved job IDs in this browser yet. Use Find recent Flow jobs or paste a job ID above.")
+            return
+
+        if st.button("Check / refresh recovered jobs", type="primary", use_container_width=True, key="refresh_recovered_jobs"):
+            payloads = dict(st.session_state.get("recovered_flow_jobs") or {})
+            errors = {}
+            bar = st.progress(0, text="Checking Flow jobs…")
+            for n, jid in enumerate(ids, 1):
+                try:
+                    payloads[jid] = flow_get_job(token, jid)
+                except Exception as exc:
+                    errors[jid] = str(exc)
+                bar.progress(n / max(1, len(ids)), text=f"Checked {n}/{len(ids)}")
+            st.session_state["recovered_flow_jobs"] = payloads
+            st.session_state["recovered_flow_errors"] = errors
+            st.rerun()
+
+        payloads = st.session_state.get("recovered_flow_jobs") or {}
+        errors = st.session_state.get("recovered_flow_errors") or {}
+        rows = []
+        for jid in ids:
+            p = payloads.get(jid) or {}
+            rows.append({
+                "Type": p.get("type") or "—",
+                "Status": _status_label(p.get("status") or ("error" if jid in errors else "not checked")),
+                "Job ID": jid,
+                "Updated": p.get("updated") or p.get("created") or "—",
+            })
+        if rows:
+            st.dataframe(rows, use_container_width=True, hide_index=True)
+
+        video_ids = [jid for jid in ids if (payloads.get(jid) or {}).get("type") == "video"]
+        if not video_ids:
+            return
+
+        chosen = st.selectbox(
+            "Recovered video",
+            options=video_ids,
+            format_func=lambda jid: f"{_status_label((payloads.get(jid) or {}).get('status'))} · {jid[:34]}…",
+            key="recovered_video_choice",
+        )
+        payload = payloads.get(chosen) or {}
+        status = str(payload.get("status") or "unknown").lower()
+        media_id, video_url, _ = _video_media_from_job(payload)
+        request = payload.get("request") or {}
+        prompt = str(request.get("prompt") or "")
+
+        with st.container(border=True):
+            st.markdown(f"<div class='product-title'>Recovered Omni video · {_status_label(status)}</div>", unsafe_allow_html=True)
+            if prompt:
+                st.caption(_short_title(prompt, 180))
+            st.code(chosen, language=None)
+
+            cache_url_key = f"recovery_url_{hashlib.sha1(chosen.encode()).hexdigest()[:12]}"
+            cache_bytes_key = f"recovery_bytes_{hashlib.sha1(chosen.encode()).hexdigest()[:12]}"
+            cached_url = st.session_state.get(cache_url_key) or video_url
+            cached_bytes = st.session_state.get(cache_bytes_key)
+
+            if status == "completed":
+                if cached_url:
+                    st.video(cached_url)
+                    st.link_button("Open original video", cached_url, use_container_width=True)
+                elif cached_bytes:
+                    st.video(cached_bytes, format="video/mp4")
+                else:
+                    st.success("Video completed. Load its playable link or MP4 below.")
+
+                x1, x2 = st.columns(2)
+                if x1.button("Get playable link", use_container_width=True, disabled=not bool(media_id), key=f"recover_link_{chosen}"):
+                    url, message = resolve_video_url(token, media_id)
+                    if url:
+                        st.session_state[cache_url_key] = url
+                        st.rerun()
+                    st.warning(message or "The signed video link is not ready yet.")
+                if x2.button("Prepare MP4", use_container_width=True, disabled=not bool(media_id), key=f"recover_mp4_{chosen}"):
+                    data, message = download_video_raw(token, media_id)
+                    if data:
+                        st.session_state[cache_bytes_key] = data
+                        st.rerun()
+                    st.warning(message or "The MP4 is not ready yet.")
+
+                cached_bytes = st.session_state.get(cache_bytes_key)
+                if cached_bytes:
+                    st.download_button(
+                        "Download recovered MP4",
+                        data=cached_bytes,
+                        file_name=f"recovered_{safe_name(chosen[:28])}.mp4",
+                        mime="video/mp4",
+                        use_container_width=True,
+                        key=f"recover_dl_{chosen}",
+                    )
+            elif status == "failed":
+                st.error(str(payload.get("error") or payload.get("errorDetails") or "Video job failed."))
+            else:
+                st.info("This job is still queued/processing. Press Check / refresh recovered jobs above to update it.")
+
 
 def main():
     st.set_page_config(page_title=APP_NAME, page_icon="🪞", layout="wide", initial_sidebar_state="expanded")
@@ -1142,6 +1388,9 @@ def main():
             if not social_token:
                 st.error("Missing SOCIAVAULT_API_KEY")
         return
+
+    # Recovery must stay visible even when there is no imported product batch.
+    render_flow_recovery(token, expanded=not bool(st.session_state.get("jobs")))
 
     # ---------------- Import / replace batch ----------------
     jobs = st.session_state.get("jobs") or []
@@ -1318,6 +1567,7 @@ def main():
                         if jobs[i].get("video_job_id") and jobs[i].get("video_status") != "failed":
                             submitted.append(i)
                 st.session_state["jobs"] = jobs
+                remember_video_job_ids(jobs)
                 if submitted:
                     st.session_state["video_batch_notice"] = f"Queued {len(submitted)} Omni 1.1 video job(s). They will update automatically."
             st.rerun()
@@ -1347,6 +1597,7 @@ def main():
                     if jobs[i].get("video_job_id") and jobs[i].get("video_status") != "failed":
                         submitted.append(i)
             st.session_state["jobs"] = jobs
+            remember_video_job_ids(jobs)
             if submitted:
                 st.session_state["video_batch_notice"] = f"Queued {len(submitted)} Omni 1.1 video job(s). They will update automatically."
             st.rerun()

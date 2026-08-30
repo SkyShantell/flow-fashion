@@ -53,3 +53,10 @@ The generation/API pipeline is unchanged.
 ## Video result behavior
 
 This UI version automatically polls async Omni 1.1 Flash jobs after submission. The app waits for `created` / `started` jobs to reach `completed`, then loads the returned MP4 in the Results view and exposes Download MP4 plus the signed original URL when available. If a generation outlasts the wait window, the job ID is retained and **Check status** / **Check all video statuses** resumes retrieval later.
+
+## R5 recovery + contrast update
+- Adds a visible **Recover existing Flow videos** panel even when no products are imported.
+- **Find recent Flow jobs** discovers executing jobs plus recent job history from useapi.
+- Direct **Job ID lookup** can reopen a known useapi Flow job and recover completed video media.
+- Newly submitted video job IDs are also copied into the page query string so they survive ordinary Streamlit redeploy/reload in the same browser URL.
+- Improved dark-theme contrast for expander headers, uploader buttons, labels, captions, disabled buttons, cards, and inputs.
