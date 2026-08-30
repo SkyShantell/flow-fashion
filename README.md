@@ -35,3 +35,21 @@ streamlit run app.py
 ## Deploy
 
 Push this folder to its own GitHub repository and deploy that repository as a separate Streamlit app. Set the secrets in the Streamlit Cloud app settings rather than committing them.
+
+## UI V2
+
+This bundle includes the redesigned dashboard UI:
+
+- readable dark theme with explicit high-contrast form controls
+- setup, avatar, pipeline mode, and scene controls moved to the sidebar
+- separate Products / Generate / Results workspaces
+- one-product-at-a-time reference editing instead of long accordions
+- compact generation metrics and status table
+- one-product-at-a-time result review with image/video side-by-side
+- batch downloads kept in the Results workspace
+
+The generation/API pipeline is unchanged.
+
+## Video result behavior
+
+This UI version automatically polls async Omni 1.1 Flash jobs after submission. The app waits for `created` / `started` jobs to reach `completed`, then loads the returned MP4 in the Results view and exposes Download MP4 plus the signed original URL when available. If a generation outlasts the wait window, the job ID is retained and **Check status** / **Check all video statuses** resumes retrieval later.

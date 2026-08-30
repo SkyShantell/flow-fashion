@@ -27,6 +27,8 @@ MAX_LINKS = 10
 MAX_PRODUCT_REFS = 5  # plus avatar = max 6 total refs, comfortably under NB2 max 10
 IMAGE_WORKERS = 3
 IMPORT_WORKERS = 4
+VIDEO_POLL_INTERVAL = 8
+VIDEO_WAIT_TIMEOUT = 600
 
 SCENES = {
     "Modern apartment mirror": "a realistic modern upscale apartment with a large full-length mirror, warm ceiling lighting, neutral furniture, and believable lived-in details",
@@ -48,23 +50,101 @@ def inject_css():
     st.markdown(
         """
         <style>
-        .stApp { background: radial-gradient(circle at top left, #111a31 0%, #090e1b 38%, #070b14 100%); color:#f5f7fb; }
-        .block-container { max-width: 1500px; padding-top: 1.4rem; padding-bottom: 5rem; }
-        .hero { border:1px solid rgba(126,157,255,.22); border-radius:26px; padding:28px 30px; background:linear-gradient(135deg,rgba(31,43,72,.78),rgba(10,15,28,.86)); box-shadow:0 22px 70px rgba(0,0,0,.28); margin-bottom:18px; }
-        .hero h1 { margin:0; font-size:2.25rem; letter-spacing:-.04em; }
-        .hero p { margin:.65rem 0 0; color:#aab5ca; font-size:1.02rem; }
-        .pill { display:inline-block; padding:7px 11px; border-radius:999px; margin:8px 7px 0 0; background:rgba(68,103,255,.13); border:1px solid rgba(116,145,255,.24); color:#cbd6ff; font-size:.82rem; }
-        div[data-testid="stVerticalBlockBorderWrapper"] { border-color:rgba(133,157,220,.20)!important; background:rgba(16,22,37,.68); border-radius:22px; }
-        div.stButton > button, div.stDownloadButton > button { min-height:48px; border-radius:16px; font-weight:700; }
-        div.stButton > button[kind="primary"] { background:linear-gradient(90deg,#3a8cff,#7559ff); border:0; }
-        .small-muted { color:#8490a6; font-size:.87rem; }
-        .status-ok { color:#68d391; font-weight:700; }
-        .status-warn { color:#f6c453; font-weight:700; }
+        :root { color-scheme: dark; }
+        html, body, [class*="css"] { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+        .stApp { background:#070b12; color:#f8fafc; }
+        [data-testid="stAppViewContainer"] { background:linear-gradient(180deg,#080d17 0%,#070b12 100%); }
+        .block-container { max-width:1280px; padding-top:2rem; padding-bottom:5rem; }
+
+        /* Sidebar */
+        section[data-testid="stSidebar"] { background:#0b111c; border-right:1px solid #1c2636; }
+        section[data-testid="stSidebar"] > div { padding-top:1rem; }
+        .sidebar-brand { padding:8px 2px 18px; }
+        .sidebar-brand .logo { font-size:1.18rem; font-weight:800; letter-spacing:-.02em; color:#fff; }
+        .sidebar-brand .sub { color:#7f8ca3; font-size:.78rem; margin-top:2px; }
+        .section-label { color:#718096; font-size:.68rem; font-weight:800; letter-spacing:.14em; margin:16px 0 8px; }
+        .connection-row { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:9px 11px; border:1px solid #1b2534; background:#0e1623; border-radius:12px; margin:7px 0; font-size:.82rem; }
+        .connection-row strong { color:#dbe5f4; font-weight:600; }
+        .dot-ok,.dot-warn { width:8px; height:8px; border-radius:999px; display:inline-block; margin-right:7px; }
+        .dot-ok { background:#22c55e; box-shadow:0 0 0 3px rgba(34,197,94,.10); }
+        .dot-warn { background:#f59e0b; box-shadow:0 0 0 3px rgba(245,158,11,.10); }
+
+        /* Header */
+        .app-header { margin-bottom:22px; }
+        .app-kicker { color:#7c8aa3; font-size:.72rem; font-weight:800; letter-spacing:.14em; text-transform:uppercase; }
+        .app-title { margin:4px 0 5px; font-size:2.05rem; line-height:1.12; letter-spacing:-.045em; font-weight:850; color:#fff; }
+        .app-subtitle { margin:0; color:#8f9bb0; max-width:760px; font-size:.94rem; line-height:1.55; }
+        .top-pills { margin-top:11px; display:flex; flex-wrap:wrap; gap:7px; }
+        .top-pill { display:inline-flex; align-items:center; padding:5px 9px; border-radius:999px; background:#101827; border:1px solid #202c3f; color:#aebbd0; font-size:.73rem; font-weight:650; }
+
+        /* Panels */
+        div[data-testid="stVerticalBlockBorderWrapper"] { border:1px solid #1b2637 !important; background:#0b111b !important; border-radius:18px !important; box-shadow:none !important; }
+        div[data-testid="stVerticalBlockBorderWrapper"] > div { padding:4px; }
+        .panel-title { font-size:1.05rem; font-weight:780; color:#f8fafc; margin:0 0 2px; }
+        .panel-sub { color:#7f8ca3; font-size:.82rem; margin-bottom:12px; }
+        .product-title { color:#f8fafc; font-size:1.08rem; font-weight:760; line-height:1.35; margin:0; }
+        .product-id { color:#66758d; font-size:.74rem; margin-top:3px; }
+
+        /* Streamlit text / labels */
+        h1,h2,h3,h4,h5,h6,p,li,span { color:inherit; }
+        [data-testid="stWidgetLabel"] p, [data-testid="stWidgetLabel"] span { color:#aeb9ca !important; font-weight:600 !important; }
+        [data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] p { color:#79869b !important; }
+        .stMarkdown p { color:#aeb9ca; }
+
+        /* Inputs */
+        .stTextInput input, .stTextArea textarea, .stNumberInput input {
+            background:#0f1724 !important; color:#f8fafc !important; border:1px solid #253247 !important; border-radius:12px !important;
+            caret-color:#8b7cff !important;
+        }
+        .stTextInput input::placeholder, .stTextArea textarea::placeholder { color:#59677c !important; opacity:1 !important; }
+        div[data-baseweb="select"] > div { background:#0f1724 !important; border-color:#253247 !important; border-radius:12px !important; color:#f8fafc !important; }
+        div[data-baseweb="select"] span, div[data-baseweb="select"] input { color:#f8fafc !important; }
+        div[data-baseweb="popover"] { color:#f8fafc !important; }
+        div[data-baseweb="popover"] ul { background:#101827 !important; }
+        div[role="option"] { color:#dce5f2 !important; background:#101827 !important; }
+        div[role="option"]:hover { background:#182338 !important; }
+        .stRadio label, .stCheckbox label { color:#cbd5e1 !important; }
+        .stFileUploader section { background:#0f1724 !important; border:1px dashed #31415b !important; border-radius:14px !important; }
+        .stFileUploader section * { color:#aeb9ca !important; }
+
+        /* Buttons */
+        div.stButton > button, div.stDownloadButton > button {
+            min-height:43px; border-radius:12px; font-weight:760; border:1px solid #27354b; background:#111a29; color:#dbe5f4;
+            transition:all .15s ease;
+        }
+        div.stButton > button:hover, div.stDownloadButton > button:hover { border-color:#566787; background:#152033; color:#fff; }
+        div.stButton > button[kind="primary"] { background:linear-gradient(90deg,#4f78ff,#7657ff); border:0; color:white; box-shadow:0 8px 22px rgba(89,90,255,.18); }
+        div.stButton > button[kind="primary"]:hover { filter:brightness(1.07); }
+        div.stButton > button:disabled, div.stDownloadButton > button:disabled {
+            background:#0b111b !important; color:#49566b !important; border-color:#182233 !important; opacity:1 !important;
+        }
+
+        /* Tabs */
+        .stTabs [data-baseweb="tab-list"] { gap:8px; border-bottom:1px solid #1a2535; }
+        .stTabs [data-baseweb="tab"] { height:44px; padding:0 16px; color:#7f8ca3; background:transparent; border-radius:10px 10px 0 0; font-weight:700; }
+        .stTabs [aria-selected="true"] { color:#fff !important; background:#101827 !important; }
+        .stTabs [data-baseweb="tab-highlight"] { background:#725dff !important; }
+
+        /* Metrics */
+        div[data-testid="stMetric"] { background:#0d1521; border:1px solid #1d293a; border-radius:15px; padding:14px 16px; }
+        div[data-testid="stMetricLabel"] p { color:#7f8ca3 !important; font-size:.76rem !important; font-weight:700 !important; }
+        div[data-testid="stMetricValue"] { color:#f8fafc !important; font-size:1.55rem !important; font-weight:790 !important; }
+
+        /* Alerts / progress */
+        div[data-testid="stAlert"] { border-radius:13px; border-width:1px; }
+        .stProgress > div > div > div > div { background:linear-gradient(90deg,#4f78ff,#7657ff); }
+
+        /* Images */
+        [data-testid="stImage"] img { border-radius:14px; border:1px solid #1d293a; }
+
+        /* Dataframe */
+        [data-testid="stDataFrame"] { border:1px solid #1b2637; border-radius:14px; overflow:hidden; }
+
+        hr { border-color:#192334 !important; }
         </style>
         """,
         unsafe_allow_html=True,
     )
-
 
 def password_gate():
     password = get_secret("APP_PASSWORD")
@@ -599,6 +679,50 @@ def refresh_one_video(job: dict, token: str) -> dict:
     return updated
 
 
+def wait_for_video(job: dict, token: str, timeout: int = VIDEO_WAIT_TIMEOUT, poll_interval: int = VIDEO_POLL_INTERVAL, progress_callback=None) -> dict:
+    """Poll an async Flow video job until it completes, fails, or the wait window ends."""
+    updated = dict(job)
+    if not updated.get("video_job_id"):
+        return updated
+
+    started_at = time.time()
+    while True:
+        updated = refresh_one_video(updated, token)
+        status = str(updated.get("video_status") or "created").lower()
+        elapsed = int(time.time() - started_at)
+        if progress_callback:
+            progress_callback(status, elapsed)
+        if status in {"completed", "failed"}:
+            return updated
+        if elapsed >= timeout:
+            updated["video_error"] = "Still generating in Google Flow. Use Check status later; the job ID has been saved."
+            return updated
+        time.sleep(poll_interval)
+
+
+def wait_for_video_batch(jobs: list[dict], token: str, indices: list[int], timeout: int = VIDEO_WAIT_TIMEOUT, poll_interval: int = VIDEO_POLL_INTERVAL, progress_callback=None) -> list[dict]:
+    """Poll a group of already-submitted jobs together so batch generation finishes in one action."""
+    jobs = [dict(j) for j in jobs]
+    pending = {i for i in indices if jobs[i].get("video_job_id") and str(jobs[i].get("video_status") or "").lower() not in {"completed", "failed"}}
+    started_at = time.time()
+    while pending:
+        for idx in list(pending):
+            jobs[idx] = refresh_one_video(jobs[idx], token)
+            if str(jobs[idx].get("video_status") or "").lower() in {"completed", "failed"}:
+                pending.discard(idx)
+        elapsed = int(time.time() - started_at)
+        if progress_callback:
+            progress_callback(len(indices) - len(pending), len(indices), elapsed, jobs)
+        if not pending or elapsed >= timeout:
+            break
+        time.sleep(poll_interval)
+
+    if pending:
+        for idx in pending:
+            jobs[idx]["video_error"] = "Still generating in Google Flow. Use Check all video statuses later; the job ID has been saved."
+    return jobs
+
+
 def safe_name(text: str, fallback: str = "product") -> str:
     text = re.sub(r"[^a-zA-Z0-9]+", "_", text or "").strip("_").lower()
     return (text[:80] or fallback)
@@ -670,86 +794,192 @@ def reset_generated(job: dict) -> dict:
     return job
 
 
+def _short_title(text: str, limit: int = 72) -> str:
+    text = str(text or "Product").strip()
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def _status_label(status: str) -> str:
+    status = str(status or "pending").lower()
+    labels = {
+        "completed": "Complete",
+        "failed": "Failed",
+        "pending": "Pending",
+        "created": "Queued",
+        "processing": "Processing",
+        "running": "Processing",
+    }
+    return labels.get(status, status.replace("_", " ").title())
+
+
 def render_job_editor(job: dict, index: int) -> dict:
+    """Focused product editor. Only one imported product is edited at a time."""
     updated = dict(job)
-    with st.expander(f"{index+1}. {job.get('name','Unknown Product')}", expanded=False):
-        updated["name"] = st.text_input("Product name", value=job.get("name", ""), key=f"name_{job['id']}")
-        focus_options = ["shirt", "pants", "outfit", "shoes"]
-        updated["focus"] = st.selectbox("What should the try-on emphasize?", focus_options, index=focus_options.index(job.get("focus", "outfit")) if job.get("focus") in focus_options else 2, key=f"focus_{job['id']}")
-        updated["back_design"] = st.checkbox("Important back design / graphic", value=bool(job.get("back_design")), key=f"back_{job['id']}")
-        st.caption("Select up to 5 clothing references. The avatar is added separately as reference #1.")
-        candidates = [("Listing", u) for u in job.get("listing_images", [])[:10]] + [("Review", u) for u in job.get("review_images", [])[:8]]
+    with st.container(border=True):
+        st.markdown(f"<div class='product-title'>{index+1}. {_short_title(job.get('name'), 110)}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='product-id'>Product ID · {job.get('id','—')}</div>", unsafe_allow_html=True)
+        st.write("")
+
+        c1, c2 = st.columns([1.55, 1], gap="large")
+        with c1:
+            updated["name"] = st.text_input("Product name", value=job.get("name", ""), key=f"name_{job['id']}")
+        with c2:
+            focus_options = ["shirt", "pants", "outfit", "shoes"]
+            current_focus = job.get("focus", "outfit") if job.get("focus") in focus_options else "outfit"
+            updated["focus"] = st.selectbox(
+                "Try-on emphasis",
+                focus_options,
+                index=focus_options.index(current_focus),
+                key=f"focus_{job['id']}",
+            )
+        updated["back_design"] = st.checkbox(
+            "Important back design / graphic",
+            value=bool(job.get("back_design")),
+            key=f"back_{job['id']}",
+        )
+
+        st.divider()
+        st.markdown("<div class='panel-title'>Choose clothing references</div>", unsafe_allow_html=True)
+        st.markdown("<div class='panel-sub'>Select up to 5. Your avatar is always sent separately as reference #1.</div>", unsafe_allow_html=True)
+
+        candidates = [("Listing", u) for u in job.get("listing_images", [])[:12]] + [("Review", u) for u in job.get("review_images", [])[:8]]
         selected = []
-        cols = st.columns(4)
-        for n, (kind, url) in enumerate(candidates):
-            with cols[n % 4]:
-                st.image(url, use_container_width=True)
-                checked = st.checkbox(f"{kind} {n+1}", value=url in (job.get("selected_refs") or []), key=f"ref_{job['id']}_{hashlib.sha1(url.encode()).hexdigest()[:8]}")
-                if checked and len(selected) < MAX_PRODUCT_REFS:
-                    selected.append(url)
+        if not candidates:
+            st.warning("No product reference images are available for this item.")
+        else:
+            cols = st.columns(5, gap="small")
+            for n, (kind, url) in enumerate(candidates):
+                with cols[n % 5]:
+                    st.image(url, use_container_width=True)
+                    checked = st.checkbox(
+                        f"{kind} {n+1}",
+                        value=url in (job.get("selected_refs") or []),
+                        key=f"ref_{job['id']}_{hashlib.sha1(url.encode()).hexdigest()[:8]}",
+                    )
+                    if checked:
+                        selected.append(url)
+
+        if len(selected) > MAX_PRODUCT_REFS:
+            st.warning(f"Only the first {MAX_PRODUCT_REFS} checked references will be used.")
+            selected = selected[:MAX_PRODUCT_REFS]
+
         if selected != (job.get("selected_refs") or []):
             updated["selected_refs"] = selected
             updated = reset_generated(updated)
-        st.caption(f"Selected {len(updated.get('selected_refs') or [])} clothing reference(s).")
+
+        st.caption(f"{len(updated.get('selected_refs') or [])}/{MAX_PRODUCT_REFS} references selected")
     return updated
 
 
 def render_job_result(job: dict, index: int, token: str, email: str, avatar_id: str, scene: str) -> dict:
     updated = dict(job)
-    st.markdown(f"#### {index+1}. {job.get('name','Product')}")
-    meta1, meta2, meta3 = st.columns(3)
-    meta1.caption(f"Focus: **{job.get('focus','outfit')}**")
-    meta2.caption(f"Image: **{job.get('image_status','pending')}**")
-    meta3.caption(f"Video: **{job.get('video_status','pending')}**")
-    img_col, vid_col = st.columns(2, gap="large")
-    with img_col:
-        image_bytes = image_bytes_from_result({"encoded": job.get("image_encoded"), "url": job.get("image_url")}) if job.get("image_status") == "completed" else None
-        if image_bytes:
-            st.image(image_bytes, caption="Nano Banana 2", width=360)
-        elif job.get("image_status") == "failed":
-            st.error(job.get("image_error") or "Image failed")
-        else:
-            st.info("Image not generated yet.")
-        if job.get("image_status") == "completed":
-            updated["approved"] = st.checkbox("Approve image for video", value=bool(job.get("approved")), key=f"approve_{job['id']}")
-            if st.button("🔁 Regenerate image", key=f"regen_img_{job['id']}", use_container_width=True):
-                with st.spinner("Regenerating Nano Banana 2 image..."):
-                    updated = generate_one_image(updated, token, email, avatar_id, scene)
+    with st.container(border=True):
+        head1, head2 = st.columns([3, 1])
+        with head1:
+            st.markdown(f"<div class='product-title'>{index+1}. {_short_title(job.get('name'), 115)}</div>", unsafe_allow_html=True)
+            st.markdown(
+                f"<div class='product-id'>Focus · {job.get('focus','outfit')} &nbsp;&nbsp;•&nbsp;&nbsp; Image · {_status_label(job.get('image_status'))} &nbsp;&nbsp;•&nbsp;&nbsp; Video · {_status_label(job.get('video_status'))}</div>",
+                unsafe_allow_html=True,
+            )
+        with head2:
+            if job.get("approved"):
+                st.success("✓ Approved")
+            elif job.get("image_status") == "completed":
+                st.info("Needs review")
+
+        st.write("")
+        img_col, vid_col = st.columns(2, gap="large")
+        with img_col:
+            st.markdown("<div class='panel-title'>Try-on image</div>", unsafe_allow_html=True)
+            st.markdown("<div class='panel-sub'>Nano Banana 2 · portrait 9:16</div>", unsafe_allow_html=True)
+            image_bytes = image_bytes_from_result({"encoded": job.get("image_encoded"), "url": job.get("image_url")}) if job.get("image_status") == "completed" else None
+            if image_bytes:
+                st.image(image_bytes, use_container_width=True)
+            elif job.get("image_status") == "failed":
+                st.error(job.get("image_error") or "Image generation failed")
+            else:
+                st.info("Generate the try-on image to preview it here.")
+
+            if job.get("image_status") == "completed":
+                approved_now = st.checkbox(
+                    "Approved for video",
+                    value=bool(job.get("approved")),
+                    key=f"approve_{job['id']}",
+                )
+                updated["approved"] = approved_now
+                if st.button("↻ Regenerate image", key=f"regen_img_{job['id']}", use_container_width=True):
+                    with st.spinner("Regenerating try-on image..."):
+                        updated = generate_one_image(updated, token, email, avatar_id, scene)
+                    st.session_state["jobs"][index] = updated
+                    st.rerun()
+
+        with vid_col:
+            st.markdown("<div class='panel-title'>Motion result</div>", unsafe_allow_html=True)
+            st.markdown("<div class='panel-sub'>Omni 1.1 Flash · 8 sec · 720p</div>", unsafe_allow_html=True)
+            if job.get("video_status") == "completed":
+                data = download_video(token, job)
+                if data:
+                    st.video(data, format="video/mp4")
+                    dl1, dl2 = st.columns(2)
+                    dl1.download_button(
+                        "↓ Download MP4",
+                        data=data,
+                        file_name=f"{safe_name(job.get('name'))}.mp4",
+                        mime="video/mp4",
+                        key=f"dl_vid_{job['id']}",
+                        use_container_width=True,
+                    )
+                    if job.get("video_url"):
+                        dl2.link_button("↗ Open original", job["video_url"], use_container_width=True)
+                elif job.get("video_url"):
+                    st.video(job["video_url"])
+                    st.link_button("↗ Open original video", job["video_url"], use_container_width=True)
+                else:
+                    st.warning("Flow says the video is complete, but the media URL was not returned. Check status once more to resolve the asset.")
+            elif job.get("video_status") == "failed":
+                st.error(job.get("video_error") or "Video generation failed")
+            elif job.get("video_job_id"):
+                st.info(f"Omni job: {_status_label(job.get('video_status'))}")
+            else:
+                st.info("Approve the image, then generate its video.")
+
+            b1, b2 = st.columns(2)
+            if b1.button(
+                "▶ Generate video",
+                key=f"gen_vid_{job['id']}",
+                use_container_width=True,
+                disabled=not bool(job.get("image_media_id")),
+            ):
+                status_box = st.status("Submitting Omni 1.1 Flash…", expanded=True)
+                updated = submit_one_video(updated, token, email)
+                st.session_state["jobs"][index] = updated
+                if updated.get("video_job_id") and updated.get("video_status") != "failed":
+                    status_box.write("Video queued. Waiting for Google Flow to finish…")
+                    def _show_poll(status, elapsed):
+                        status_box.update(label=f"Generating video · {_status_label(status)} · {elapsed}s", state="running")
+                    updated = wait_for_video(updated, token, progress_callback=_show_poll)
+                    st.session_state["jobs"][index] = updated
+                    if updated.get("video_status") == "completed":
+                        status_box.update(label="Video ready", state="complete", expanded=False)
+                    elif updated.get("video_status") == "failed":
+                        status_box.update(label="Video generation failed", state="error", expanded=True)
+                    else:
+                        status_box.update(label="Video is still generating", state="running", expanded=True)
+                st.rerun()
+            if b2.button(
+                "↻ Check status",
+                key=f"refresh_vid_{job['id']}",
+                use_container_width=True,
+                disabled=not bool(job.get("video_job_id")),
+            ):
+                with st.spinner("Checking Google Flow and loading the MP4 if it is ready…"):
+                    updated = refresh_one_video(updated, token)
                 st.session_state["jobs"][index] = updated
                 st.rerun()
-    with vid_col:
-        if job.get("video_status") == "completed":
-            data = download_video(token, job)
-            if data:
-                st.video(data)
-                st.download_button("⬇️ Download video", data=data, file_name=f"{safe_name(job.get('name'))}.mp4", mime="video/mp4", key=f"dl_vid_{job['id']}", use_container_width=True)
-            elif job.get("video_url"):
-                st.video(job["video_url"])
-            else:
-                st.warning("Video completed but the file could not be fetched yet. Refresh the result.")
-        elif job.get("video_status") == "failed":
-            st.error(job.get("video_error") or "Video failed")
-        elif job.get("video_job_id"):
-            st.info(f"Omni 1.1: {job.get('video_status','processing')}")
-        else:
-            st.info("Video not submitted yet.")
-        b1, b2 = st.columns(2)
-        if b1.button("🎬 Generate video", key=f"gen_vid_{job['id']}", use_container_width=True, disabled=not bool(job.get("image_media_id"))):
-            with st.spinner("Submitting Omni 1.1 Flash..."):
-                updated = submit_one_video(updated, token, email)
-            st.session_state["jobs"][index] = updated
-            st.rerun()
-        if b2.button("🔄 Refresh video", key=f"refresh_vid_{job['id']}", use_container_width=True, disabled=not bool(job.get("video_job_id"))):
-            with st.spinner("Refreshing video result..."):
-                updated = refresh_one_video(updated, token)
-            st.session_state["jobs"][index] = updated
-            st.rerun()
-    st.divider()
     return updated
 
-
 def main():
-    st.set_page_config(page_title=APP_NAME, page_icon="🪞", layout="wide")
+    st.set_page_config(page_title=APP_NAME, page_icon="🪞", layout="wide", initial_sidebar_state="expanded")
     inject_css()
     password_gate()
 
@@ -758,211 +988,377 @@ def main():
     flow_email = get_secret("GOOGLE_FLOW_EMAIL")
     region = get_secret("SOCIAVAULT_REGION", "US") or "US"
 
-    st.markdown(
-        f"""<div class='hero'><div class='small-muted'>STANDALONE BULK TRY-ON PIPELINE</div><h1>🪞 {APP_NAME}</h1><p>Paste 5–10 TikTok Shop links. SociaVault imports the products, Google Flow Nano Banana 2 creates the try-on stills, and Omni 1.1 Flash turns them into 8-second 720p videos.</p><span class='pill'>Nano Banana 2 · 9:16</span><span class='pill'>Omni 1.1 Flash · 720p · 8s</span><span class='pill'>Avatar always reference #1</span></div>""",
-        unsafe_allow_html=True,
-    )
-
-    with st.expander("Connections", expanded=not bool(token and social_token)):
-        c1, c2, c3 = st.columns(3)
-        c1.success("useapi connected") if token else c1.error("Add USEAPI_TOKEN")
-        c2.success("SociaVault connected") if social_token else c2.error("Add SOCIAVAULT_API_KEY")
-        c3.info(f"Flow account: {flow_email}") if flow_email else c3.info("Flow account: auto (best with one configured account)")
-        if token and st.button("Test Flow connection"):
-            try:
-                accounts = flow_accounts(token)
-                st.success(f"Flow API reachable · {len(accounts)} configured account(s)")
-                if len(accounts) > 1 and not flow_email:
-                    st.warning("You have multiple Flow accounts. Set GOOGLE_FLOW_EMAIL so the avatar and every clothing reference are guaranteed to land on the same account.")
-            except Exception as exc:
-                st.error(str(exc))
-
-    if not token or not social_token:
-        st.stop()
-
-    st.markdown("## 1 · Choose the avatar")
+    # ---------------- Sidebar: setup only ----------------
     avatar_bytes = None
     avatar_mime = "image/jpeg"
     avatar_label = "Avatar"
     library = avatar_library()
-    source_choices = ["Upload image"] + (["Saved avatar"] if library else [])
-    avatar_source = st.radio("Avatar source", source_choices, horizontal=True)
-    if avatar_source == "Saved avatar":
-        options = {p.stem.replace("_", " ").title(): p for p in library}
-        label = st.selectbox("Saved avatar", list(options.keys()))
-        path = options[label]
-        avatar_bytes = path.read_bytes()
-        avatar_mime = "image/png" if path.suffix.lower() == ".png" else "image/webp" if path.suffix.lower() == ".webp" else "image/jpeg"
-        avatar_label = label
-        st.image(avatar_bytes, width=280, caption=label)
-    else:
-        avatar_file = st.file_uploader("Avatar reference image", type=["jpg", "jpeg", "png", "webp"])
-        if avatar_file:
-            avatar_bytes = avatar_file.getvalue()
-            avatar_mime = avatar_file.type or "image/jpeg"
-            avatar_label = Path(avatar_file.name).stem
-            st.image(avatar_bytes, width=280, caption="This person will be reference #1 for every product")
+
+    with st.sidebar:
+        st.markdown(
+            "<div class='sidebar-brand'><div class='logo'>🪞 Flow Try-On Factory</div><div class='sub'>Bulk clothing try-ons → motion</div></div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown("<div class='section-label'>CONNECTIONS</div>", unsafe_allow_html=True)
+        st.markdown(
+            f"<div class='connection-row'><strong><span class='{'dot-ok' if token else 'dot-warn'}'></span>Google Flow</strong><span>{'Ready' if token else 'Missing key'}</span></div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f"<div class='connection-row'><strong><span class='{'dot-ok' if social_token else 'dot-warn'}'></span>SociaVault</strong><span>{'Ready' if social_token else 'Missing key'}</span></div>",
+            unsafe_allow_html=True,
+        )
+        if flow_email:
+            st.caption(f"Flow account · {flow_email}")
+
+        if token and st.button("Test Flow connection", use_container_width=True):
+            try:
+                accounts = flow_accounts(token)
+                st.success(f"Flow reachable · {len(accounts)} account(s)")
+                if len(accounts) > 1 and not flow_email:
+                    st.warning("Set GOOGLE_FLOW_EMAIL when using multiple Flow accounts.")
+            except Exception as exc:
+                st.error(str(exc))
+
+        st.markdown("<div class='section-label'>AVATAR</div>", unsafe_allow_html=True)
+        source_choices = ["Upload image"] + (["Saved avatar"] if library else [])
+        avatar_source = st.radio("Avatar source", source_choices, horizontal=True, label_visibility="collapsed")
+        if avatar_source == "Saved avatar":
+            options = {p.stem.replace("_", " ").title(): p for p in library}
+            label = st.selectbox("Saved avatar", list(options.keys()), label_visibility="collapsed")
+            path = options[label]
+            avatar_bytes = path.read_bytes()
+            avatar_mime = "image/png" if path.suffix.lower() == ".png" else "image/webp" if path.suffix.lower() == ".webp" else "image/jpeg"
+            avatar_label = label
+            st.image(avatar_bytes, use_container_width=True)
+            st.caption(label)
+        else:
+            avatar_file = st.file_uploader("Avatar reference", type=["jpg", "jpeg", "png", "webp"], label_visibility="collapsed")
+            if avatar_file:
+                avatar_bytes = avatar_file.getvalue()
+                avatar_mime = avatar_file.type or "image/jpeg"
+                avatar_label = Path(avatar_file.name).stem
+                st.image(avatar_bytes, use_container_width=True)
+                st.caption("Reference #1 for every product")
+            else:
+                st.caption("Upload the person used across this batch.")
+
+        st.markdown("<div class='section-label'>BATCH SETTINGS</div>", unsafe_allow_html=True)
+        run_mode = st.radio("Pipeline", ["Review images first", "Full auto"], vertical=True)
+        scene = st.selectbox("Mirror setting", list(SCENES.keys()), index=0)
+        st.caption("Nano Banana 2 · 9:16\n\nOmni 1.1 Flash · 8s · 720p")
+
+        if st.session_state.get("jobs"):
+            st.divider()
+            if st.button("Clear current batch", use_container_width=True):
+                st.session_state.pop("jobs", None)
+                st.session_state.pop("videos_zip", None)
+                st.rerun()
 
     avatar_hash = hashlib.sha1(avatar_bytes).hexdigest() if avatar_bytes else ""
     if avatar_hash and st.session_state.get("avatar_hash") != avatar_hash:
         st.session_state["avatar_hash"] = avatar_hash
         st.session_state.pop("avatar_flow_id", None)
-        # Changing avatar invalidates every generated result.
         if st.session_state.get("jobs"):
             st.session_state["jobs"] = [reset_generated(j) for j in st.session_state["jobs"]]
 
-    st.markdown("## 2 · Import 5–10 products")
-    raw_links = st.text_area("One TikTok Shop link per line", height=150, placeholder="https://www.tiktok.com/view/product/...\nhttps://www.tiktok.com/view/product/...")
-    links = dedupe([x.strip() for x in raw_links.splitlines() if x.strip() and not x.strip().startswith("#")])[:MAX_LINKS]
-    if len([x for x in raw_links.splitlines() if x.strip()]) > MAX_LINKS:
-        st.warning(f"This app processes up to {MAX_LINKS} links per batch. The first {MAX_LINKS} will be used.")
+    # ---------------- Main header ----------------
+    st.markdown(
+        """
+        <div class='app-header'>
+          <div class='app-kicker'>AI TRY-ON WORKSPACE</div>
+          <div class='app-title'>Create product try-ons without the clutter.</div>
+          <p class='app-subtitle'>Import TikTok Shop clothing, choose the exact reference photos, generate the stills, approve what you like, then turn them into short motion clips.</p>
+          <div class='top-pills'>
+            <span class='top-pill'>SociaVault import</span>
+            <span class='top-pill'>Nano Banana 2</span>
+            <span class='top-pill'>Omni 1.1 Flash</span>
+            <span class='top-pill'>Up to 10 products</span>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    if st.button("📦 Import products with SociaVault", type="primary", use_container_width=True, disabled=not bool(links)):
-        imported = []
-        errors = []
-        progress = st.progress(0, text="Importing products...")
-        with ThreadPoolExecutor(max_workers=min(IMPORT_WORKERS, len(links))) as ex:
-            future_map = {ex.submit(import_product, link, social_token, region): link for link in links}
-            done = 0
-            for fut in as_completed(future_map):
-                link = future_map[fut]
-                try:
-                    imported.append(fut.result())
-                except Exception as exc:
-                    errors.append((link, str(exc)))
-                done += 1
-                progress.progress(done / len(links), text=f"Imported {done}/{len(links)}")
-        # Restore original link order.
-        by_url = {j["url"]: j for j in imported}
-        st.session_state["jobs"] = [by_url[x] for x in links if x in by_url]
-        if errors:
-            st.session_state["import_errors"] = errors
-        st.rerun()
+    if not token or not social_token:
+        with st.container(border=True):
+            st.markdown("<div class='panel-title'>Finish connecting the app</div>", unsafe_allow_html=True)
+            st.markdown("<div class='panel-sub'>The interface is ready, but generation is locked until both API secrets are configured.</div>", unsafe_allow_html=True)
+            if not token:
+                st.error("Missing USEAPI_TOKEN")
+            if not social_token:
+                st.error("Missing SOCIAVAULT_API_KEY")
+        return
+
+    # ---------------- Import / replace batch ----------------
+    jobs = st.session_state.get("jobs") or []
+    with st.expander("Import products" if not jobs else "Import or replace batch", expanded=not bool(jobs)):
+        st.markdown("<div class='panel-title'>TikTok Shop products</div>", unsafe_allow_html=True)
+        st.markdown("<div class='panel-sub'>Paste one product URL per line. The first 10 valid links are used.</div>", unsafe_allow_html=True)
+        raw_links = st.text_area(
+            "TikTok Shop links",
+            height=145,
+            placeholder="https://www.tiktok.com/shop/pdp/...\nhttps://www.tiktok.com/shop/pdp/...",
+            label_visibility="collapsed",
+        )
+        raw_count = len([x for x in raw_links.splitlines() if x.strip()])
+        links = dedupe([x.strip() for x in raw_links.splitlines() if x.strip() and not x.strip().startswith("#")])[:MAX_LINKS]
+        if raw_count > MAX_LINKS:
+            st.warning(f"Only the first {MAX_LINKS} links will be processed.")
+
+        if st.button("Import products with SociaVault", type="primary", use_container_width=True, disabled=not bool(links)):
+            imported = []
+            errors = []
+            progress = st.progress(0, text="Importing products...")
+            with ThreadPoolExecutor(max_workers=min(IMPORT_WORKERS, len(links))) as ex:
+                future_map = {ex.submit(import_product, link, social_token, region): link for link in links}
+                done = 0
+                for fut in as_completed(future_map):
+                    link = future_map[fut]
+                    try:
+                        imported.append(fut.result())
+                    except Exception as exc:
+                        errors.append((link, str(exc)))
+                    done += 1
+                    progress.progress(done / len(links), text=f"Imported {done}/{len(links)}")
+            by_url = {j["url"]: j for j in imported}
+            st.session_state["jobs"] = [by_url[x] for x in links if x in by_url]
+            st.session_state.pop("videos_zip", None)
+            if errors:
+                st.session_state["import_errors"] = errors
+            st.rerun()
 
     if st.session_state.get("import_errors"):
         for link, error in st.session_state.pop("import_errors"):
-            st.warning(f"Could not import {link[:65]}… — {error}")
+            st.warning(f"Could not import {_short_title(link, 65)} — {error}")
 
     jobs = st.session_state.get("jobs") or []
     if not jobs:
-        st.stop()
-
-    st.success(f"{len(jobs)} product(s) ready")
-    st.markdown("## 3 · Review references and batch settings")
-    settings1, settings2 = st.columns(2)
-    with settings1:
-        run_mode = st.radio("Pipeline mode", ["Review images first", "Full auto"], horizontal=True)
-    with settings2:
-        scene = st.selectbox("Mirror setting", list(SCENES.keys()), index=0)
-
-    new_jobs = []
-    for i, job in enumerate(jobs):
-        new_jobs.append(render_job_editor(job, i))
-    st.session_state["jobs"] = new_jobs
-    jobs = new_jobs
-
-    st.markdown("## 4 · Run the batch")
-    if not avatar_bytes:
-        st.warning("Choose an avatar before generating.")
+        with st.container(border=True):
+            st.markdown("<div class='panel-title'>Start with your products</div>", unsafe_allow_html=True)
+            st.markdown("<div class='panel-sub'>Import a batch above. Once products are loaded, this workspace changes into Product, Generate, and Results views.</div>", unsafe_allow_html=True)
+            st.info("No products imported yet.")
+        return
 
     completed_images = sum(1 for j in jobs if j.get("image_status") == "completed")
     approved = sum(1 for j in jobs if j.get("approved"))
     completed_videos = sum(1 for j in jobs if j.get("video_status") == "completed")
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Products", len(jobs))
-    m2.metric("Images complete", f"{completed_images}/{len(jobs)}")
-    m3.metric("Approved", approved)
-    m4.metric("Videos complete", f"{completed_videos}/{len(jobs)}")
 
-    b1, b2, b3 = st.columns(3)
-    generate_images = b1.button("🖼️ Generate all images", type="primary", use_container_width=True, disabled=not bool(avatar_bytes))
-    run_full = b2.button("🚀 Run full batch", use_container_width=True, disabled=not bool(avatar_bytes))
-    refresh_all = b3.button("🔄 Refresh all videos", use_container_width=True, disabled=not any(j.get("video_job_id") for j in jobs))
+    tabs = st.tabs(["Products", "Generate", "Results"])
 
-    if generate_images or run_full:
-        if not st.session_state.get("avatar_flow_id"):
-            with st.spinner("Uploading avatar to Google Flow as reference #1..."):
-                try:
-                    st.session_state["avatar_flow_id"] = flow_upload_asset(token, avatar_bytes, avatar_mime, flow_email)
-                except Exception as exc:
-                    st.error(f"Avatar upload failed: {exc}")
-                    st.stop()
-        avatar_id = st.session_state["avatar_flow_id"]
-        indices = [i for i, j in enumerate(jobs) if j.get("selected_refs")]
-        progress = st.progress(0, text="Generating Nano Banana 2 images...")
-        updates = {}
-        with ThreadPoolExecutor(max_workers=min(IMAGE_WORKERS, len(indices) or 1)) as ex:
-            futures = {ex.submit(generate_one_image, jobs[i], token, flow_email, avatar_id, scene): i for i in indices}
-            done = 0
-            for fut in as_completed(futures):
-                idx = futures[fut]
-                updates[idx] = fut.result()
-                done += 1
-                progress.progress(done / max(1, len(indices)), text=f"Images {done}/{len(indices)}")
-        for idx, update in updates.items():
-            jobs[idx] = update
+    # ---------------- Products tab ----------------
+    with tabs[0]:
+        st.write("")
+        top1, top2 = st.columns([3, 1])
+        with top1:
+            st.markdown("<div class='panel-title'>Product references</div>", unsafe_allow_html=True)
+            st.markdown("<div class='panel-sub'>Edit one product at a time instead of opening giant accordions.</div>", unsafe_allow_html=True)
+        with top2:
+            st.metric("Imported", len(jobs))
+
+        selected_index = st.selectbox(
+            "Product to edit",
+            options=list(range(len(jobs))),
+            format_func=lambda i: f"{i+1}. {_short_title(jobs[i].get('name'), 82)}",
+            key="product_editor_index",
+        )
+        edited = render_job_editor(jobs[selected_index], selected_index)
+        jobs[selected_index] = edited
         st.session_state["jobs"] = jobs
 
-        if run_full or run_mode == "Full auto":
-            for i, job in enumerate(jobs):
+        st.write("")
+        st.markdown("<div class='panel-title'>Batch overview</div>", unsafe_allow_html=True)
+        rows = []
+        for i, job in enumerate(jobs, 1):
+            rows.append({
+                "#": i,
+                "Product": _short_title(job.get("name"), 58),
+                "Focus": job.get("focus", "outfit"),
+                "Refs": len(job.get("selected_refs") or []),
+                "Image": _status_label(job.get("image_status")),
+                "Video": _status_label(job.get("video_status")),
+            })
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+
+    # ---------------- Generate tab ----------------
+    with tabs[1]:
+        st.write("")
+        st.markdown("<div class='panel-title'>Batch generation</div>", unsafe_allow_html=True)
+        st.markdown("<div class='panel-sub'>Run the still-image stage, approve images, then generate motion. Full auto can do both stages in one pass.</div>", unsafe_allow_html=True)
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Products", len(jobs))
+        m2.metric("Images", f"{completed_images}/{len(jobs)}")
+        m3.metric("Approved", f"{approved}/{len(jobs)}")
+        m4.metric("Videos", f"{completed_videos}/{len(jobs)}")
+
+        if not avatar_bytes:
+            st.warning("Add an avatar in the left sidebar before generating.")
+
+        with st.container(border=True):
+            st.markdown("<div class='panel-title'>Actions</div>", unsafe_allow_html=True)
+            st.markdown("<div class='panel-sub'>Only actions that are currently available are enabled.</div>", unsafe_allow_html=True)
+            a1, a2, a3 = st.columns(3)
+            generate_images = a1.button(
+                "Generate all images",
+                type="primary",
+                use_container_width=True,
+                disabled=not bool(avatar_bytes),
+            )
+            run_full = a2.button(
+                "Run full batch",
+                use_container_width=True,
+                disabled=not bool(avatar_bytes),
+            )
+            refresh_all = a3.button(
+                "Check all video statuses",
+                use_container_width=True,
+                disabled=not any(j.get("video_job_id") for j in jobs),
+            )
+
+            b1, b2 = st.columns(2)
+            approve_all = b1.button(
+                "Approve all completed images",
+                use_container_width=True,
+                disabled=not any(j.get("image_status") == "completed" and not j.get("approved") for j in jobs),
+            )
+            generate_approved = b2.button(
+                "Generate videos for approved",
+                use_container_width=True,
+                disabled=not any(j.get("approved") and j.get("image_media_id") for j in jobs),
+            )
+
+        if generate_images or run_full:
+            if not st.session_state.get("avatar_flow_id"):
+                with st.spinner("Uploading avatar to Google Flow as reference #1..."):
+                    try:
+                        st.session_state["avatar_flow_id"] = flow_upload_asset(token, avatar_bytes, avatar_mime, flow_email)
+                    except Exception as exc:
+                        st.error(f"Avatar upload failed: {exc}")
+                        st.stop()
+            avatar_id = st.session_state["avatar_flow_id"]
+            indices = [i for i, j in enumerate(jobs) if j.get("selected_refs")]
+            progress = st.progress(0, text="Generating Nano Banana 2 images...")
+            updates = {}
+            with ThreadPoolExecutor(max_workers=min(IMAGE_WORKERS, len(indices) or 1)) as ex:
+                futures = {ex.submit(generate_one_image, jobs[i], token, flow_email, avatar_id, scene): i for i in indices}
+                done = 0
+                for fut in as_completed(futures):
+                    idx = futures[fut]
+                    updates[idx] = fut.result()
+                    done += 1
+                    progress.progress(done / max(1, len(indices)), text=f"Images {done}/{len(indices)}")
+            for idx, update in updates.items():
+                jobs[idx] = update
+            st.session_state["jobs"] = jobs
+
+            if run_full or run_mode == "Full auto":
+                submitted = []
+                for i, job in enumerate(jobs):
+                    if job.get("image_status") == "completed":
+                        job["approved"] = True
+                        jobs[i] = submit_one_video(job, token, flow_email)
+                        if jobs[i].get("video_job_id") and jobs[i].get("video_status") != "failed":
+                            submitted.append(i)
+                st.session_state["jobs"] = jobs
+                if submitted:
+                    video_bar = st.progress(0, text=f"Omni 1.1 videos queued · 0/{len(submitted)} ready")
+                    def _batch_progress(done, total, elapsed, current_jobs):
+                        video_bar.progress(done / max(1, total), text=f"Waiting for Omni 1.1 · {done}/{total} finished · {elapsed}s")
+                        st.session_state["jobs"] = current_jobs
+                    jobs = wait_for_video_batch(jobs, token, submitted, progress_callback=_batch_progress)
+                    st.session_state["jobs"] = jobs
+            st.rerun()
+
+        if refresh_all:
+            targets = [i for i, j in enumerate(jobs) if j.get("video_job_id")]
+            bar = st.progress(0, text="Refreshing Omni 1.1 jobs...")
+            for n, idx in enumerate(targets, 1):
+                jobs[idx] = refresh_one_video(jobs[idx], token)
+                bar.progress(n / len(targets), text=f"Refreshed {n}/{len(targets)}")
+            st.session_state["jobs"] = jobs
+            st.rerun()
+
+        if approve_all:
+            for job in jobs:
                 if job.get("image_status") == "completed":
                     job["approved"] = True
-                    jobs[i] = submit_one_video(job, token, flow_email)
             st.session_state["jobs"] = jobs
-        st.rerun()
+            st.rerun()
 
-    if refresh_all:
-        bar = st.progress(0, text="Refreshing Omni 1.1 jobs...")
-        targets = [i for i, j in enumerate(jobs) if j.get("video_job_id")]
-        for n, idx in enumerate(targets, 1):
-            jobs[idx] = refresh_one_video(jobs[idx], token)
-            bar.progress(n / len(targets), text=f"Refreshed {n}/{len(targets)}")
+        if generate_approved:
+            submitted = []
+            for i, job in enumerate(jobs):
+                if job.get("approved") and job.get("image_media_id"):
+                    jobs[i] = submit_one_video(job, token, flow_email)
+                    if jobs[i].get("video_job_id") and jobs[i].get("video_status") != "failed":
+                        submitted.append(i)
+            st.session_state["jobs"] = jobs
+            if submitted:
+                video_bar = st.progress(0, text=f"Omni 1.1 videos queued · 0/{len(submitted)} ready")
+                def _batch_progress(done, total, elapsed, current_jobs):
+                    video_bar.progress(done / max(1, total), text=f"Waiting for Omni 1.1 · {done}/{total} finished · {elapsed}s")
+                    st.session_state["jobs"] = current_jobs
+                jobs = wait_for_video_batch(jobs, token, submitted, progress_callback=_batch_progress)
+                st.session_state["jobs"] = jobs
+            st.rerun()
+
+        status_rows = []
+        for i, job in enumerate(jobs, 1):
+            status_rows.append({
+                "#": i,
+                "Product": _short_title(job.get("name"), 55),
+                "Image": _status_label(job.get("image_status")),
+                "Approved": "Yes" if job.get("approved") else "No",
+                "Video": _status_label(job.get("video_status")),
+            })
+        st.dataframe(status_rows, use_container_width=True, hide_index=True)
+
+    # ---------------- Results tab ----------------
+    with tabs[2]:
+        st.write("")
+        r1, r2 = st.columns([3, 1])
+        with r1:
+            st.markdown("<div class='panel-title'>Review results</div>", unsafe_allow_html=True)
+            st.markdown("<div class='panel-sub'>Jump between products without scrolling through a long wall of results.</div>", unsafe_allow_html=True)
+        with r2:
+            st.metric("Ready videos", completed_videos)
+
+        result_index = st.selectbox(
+            "Product result",
+            options=list(range(len(jobs))),
+            format_func=lambda i: f"{i+1}. {_short_title(jobs[i].get('name'), 82)}",
+            key="result_product_index",
+        )
+        avatar_id = st.session_state.get("avatar_flow_id", "")
+        updated = render_job_result(jobs[result_index], result_index, token, flow_email, avatar_id, scene)
+        jobs[result_index] = updated
         st.session_state["jobs"] = jobs
-        st.rerun()
 
-    review_controls = st.columns(3)
-    if review_controls[0].button("✅ Approve all completed images", use_container_width=True):
-        for job in jobs:
-            if job.get("image_status") == "completed":
-                job["approved"] = True
-        st.session_state["jobs"] = jobs
-        st.rerun()
-    if review_controls[1].button("🎬 Generate videos for approved", use_container_width=True, disabled=not any(j.get("approved") and j.get("image_media_id") for j in jobs)):
-        for i, job in enumerate(jobs):
-            if job.get("approved") and job.get("image_media_id"):
-                jobs[i] = submit_one_video(job, token, flow_email)
-        st.session_state["jobs"] = jobs
-        st.rerun()
-    if review_controls[2].button("🧹 Clear batch", use_container_width=True):
-        st.session_state.pop("jobs", None)
-        st.rerun()
+        st.write("")
+        with st.container(border=True):
+            st.markdown("<div class='panel-title'>Batch downloads</div>", unsafe_allow_html=True)
+            st.markdown("<div class='panel-sub'>Package completed files only, or save the batch manifest for reference.</div>", unsafe_allow_html=True)
+            d1, d2, d3 = st.columns(3)
+            images_zip = build_images_zip(jobs)
+            if images_zip:
+                d1.download_button("Download all images", data=images_zip, file_name="flow_tryon_images.zip", mime="application/zip", use_container_width=True)
+            else:
+                d1.button("Download all images", disabled=True, use_container_width=True)
 
-    st.markdown("## 5 · Results")
-    avatar_id = st.session_state.get("avatar_flow_id", "")
-    results = []
-    for i, job in enumerate(st.session_state.get("jobs") or []):
-        results.append(render_job_result(job, i, token, flow_email, avatar_id, scene))
-    st.session_state["jobs"] = results
+            if any(j.get("video_status") == "completed" for j in jobs):
+                if d2.button("Prepare videos ZIP", use_container_width=True):
+                    with st.spinner("Downloading completed videos from Flow..."):
+                        z = build_videos_zip(jobs, token)
+                    if z:
+                        st.session_state["videos_zip"] = z
+                        st.rerun()
+                if st.session_state.get("videos_zip"):
+                    d2.download_button("Download all videos", data=st.session_state["videos_zip"], file_name="flow_tryon_videos.zip", mime="application/zip", use_container_width=True)
+            else:
+                d2.button("Download all videos", disabled=True, use_container_width=True)
 
-    st.markdown("## Batch downloads")
-    d1, d2, d3 = st.columns(3)
-    images_zip = build_images_zip(results)
-    if images_zip:
-        d1.download_button("⬇️ All images ZIP", data=images_zip, file_name="flow_tryon_images.zip", mime="application/zip", use_container_width=True)
-    else:
-        d1.button("⬇️ All images ZIP", disabled=True, use_container_width=True)
-    if any(j.get("video_status") == "completed" for j in results):
-        if d2.button("Prepare videos ZIP", use_container_width=True):
-            with st.spinner("Downloading completed videos from Flow..."):
-                z = build_videos_zip(results, token)
-            if z:
-                st.session_state["videos_zip"] = z
-                st.rerun()
-        if st.session_state.get("videos_zip"):
-            d2.download_button("⬇️ All videos ZIP", data=st.session_state["videos_zip"], file_name="flow_tryon_videos.zip", mime="application/zip", use_container_width=True)
-    else:
-        d2.button("⬇️ All videos ZIP", disabled=True, use_container_width=True)
-    d3.download_button("⬇️ Batch manifest", data=jobs_to_manifest(results), file_name="flow_tryon_batch.json", mime="application/json", use_container_width=True)
+            d3.download_button("Download manifest", data=jobs_to_manifest(jobs), file_name="flow_tryon_batch.json", mime="application/json", use_container_width=True)
 
 
 if __name__ == "__main__":
