@@ -84,6 +84,24 @@ def get_google_service_account_info() -> dict | None:
     return None
 
 
+def get_drive_archive_config() -> dict:
+    """Configuration for the user-owned Google Drive archive web app.
+
+    We intentionally use an Apps Script web app for ordinary My Drive accounts.
+    Google service accounts have no Drive storage quota and cannot own files in
+    My Drive, so the service account used for Sheets is not a durable media store.
+    """
+    url = get_secret("GOOGLE_DRIVE_ARCHIVE_WEBHOOK_URL")
+    secret = get_secret("GOOGLE_DRIVE_ARCHIVE_SECRET")
+    auto_raw = get_secret("GOOGLE_DRIVE_AUTO_ARCHIVE", "true").lower()
+    return {
+        "url": url,
+        "secret": secret,
+        "configured": bool(url and secret),
+        "auto": auto_raw not in {"0", "false", "no", "off"},
+    }
+
+
 def inject_css():
     st.markdown(
         """
@@ -847,6 +865,15 @@ def generate_one_image(job: dict, token: str, email: str, avatar_id: str, scene:
             "video_url": None,
             "video_media_id": None,
             "video_error": None,
+            "drive_image_id": None,
+            "drive_image_url": None,
+            "drive_image_download_url": None,
+            "drive_image_error": None,
+            "drive_video_id": None,
+            "drive_video_url": None,
+            "drive_video_download_url": None,
+            "drive_video_error": None,
+            "drive_batch_folder_url": None,
         })
     except Exception as exc:
         updated["image_status"] = "failed"
@@ -869,6 +896,10 @@ def submit_one_video(job: dict, token: str, email: str) -> dict:
             "video_url": None,
             "video_media_id": None,
             "video_error": None,
+            "drive_video_id": None,
+            "drive_video_url": None,
+            "drive_video_download_url": None,
+            "drive_video_error": None,
         })
     except Exception as exc:
         updated["video_status"] = "failed"
@@ -964,10 +995,15 @@ def jobs_export_rows(jobs: list[dict]) -> tuple[list[str], list[list[str]]]:
         "Approved",
         "Image URL",
         "Image media ID",
+        "Google Drive image URL",
+        "Google Drive image file ID",
         "Video status",
         "Video URL",
         "Video media ID",
         "Video job ID",
+        "Google Drive video URL",
+        "Google Drive video file ID",
+        "Google Drive batch folder",
         "Selected reference URLs",
     ]
     rows = []
@@ -983,10 +1019,15 @@ def jobs_export_rows(jobs: list[dict]) -> tuple[list[str], list[list[str]]]:
             "Yes" if job.get("approved") else "No",
             str(job.get("image_url") or ""),
             str(job.get("image_media_id") or ""),
+            str(job.get("drive_image_url") or ""),
+            str(job.get("drive_image_id") or ""),
             _status_label(job.get("video_status")),
             str(job.get("video_url") or ""),
             str(job.get("video_media_id") or ""),
             str(job.get("video_job_id") or ""),
+            str(job.get("drive_video_url") or ""),
+            str(job.get("drive_video_id") or ""),
+            str(job.get("drive_batch_folder_url") or ""),
             " | ".join(str(x) for x in (job.get("selected_refs") or []) if x),
         ])
     return headers, rows
@@ -1090,6 +1131,126 @@ def build_full_batch_zip(jobs: list[dict], token: str) -> tuple[bytes | None, di
     return (payload if (jobs or image_count or video_count) else None), {"images": image_count, "videos": video_count}
 
 
+def image_bytes_for_job(job: dict) -> tuple[bytes | None, str]:
+    """Return durable bytes for a completed generated image."""
+    if job.get("image_encoded"):
+        try:
+            return base64.b64decode(job["image_encoded"]), "image/jpeg"
+        except Exception:
+            pass
+    url = str(job.get("image_url") or "").strip()
+    if url:
+        try:
+            data, mime = download_url(url, 120)
+            return data, (mime or "image/jpeg")
+        except Exception:
+            pass
+    return None, "image/jpeg"
+
+
+def drive_batch_name(jobs: list[dict]) -> str:
+    """Deterministic folder name so a retry/redeploy does not create a new batch."""
+    fingerprint = "|".join(str(j.get("url") or j.get("id") or j.get("name") or "") for j in jobs)
+    digest = hashlib.sha1(fingerprint.encode("utf-8")).hexdigest()[:8] if fingerprint else "batch"
+    return f"Flow Try-On {digest}"
+
+
+def _archive_filename(index: int, job: dict, kind: str) -> str:
+    media_id = str(job.get("image_media_id") if kind == "image" else job.get("video_media_id") or job.get("video_job_id") or "")
+    media_tag = safe_name(media_id, "media")[-18:]
+    ext = "jpg" if kind == "image" else "mp4"
+    return f"{index:02d}_{safe_name(job.get('name'))}_{media_tag}.{ext}"
+
+
+def archive_bytes_to_google_drive(data: bytes, mime_type: str, filename: str, kind: str, batch_name: str, description: str = "") -> tuple[dict | None, str]:
+    """Upload one media file to the user's Drive through the Apps Script bridge."""
+    cfg = get_drive_archive_config()
+    if not cfg["configured"]:
+        return None, "Google Drive archive is not configured."
+    # Keep the Apps Script JSON request comfortably below common web-app limits.
+    if len(data) > 32 * 1024 * 1024:
+        return None, f"{filename} is larger than 32 MB; use the local batch download for this file."
+    body = {
+        "secret": cfg["secret"],
+        "filename": filename,
+        "mime_type": mime_type,
+        "kind": kind,
+        "batch_name": batch_name,
+        "description": description,
+        "data_base64": base64.b64encode(data).decode("ascii"),
+    }
+    try:
+        resp = requests.post(cfg["url"], json=body, timeout=180, allow_redirects=True)
+        if resp.status_code >= 400:
+            return None, f"Drive archive HTTP {resp.status_code}: {resp.text[:300]}"
+        try:
+            payload = resp.json()
+        except Exception:
+            return None, f"Drive archive returned a non-JSON response: {resp.text[:300]}"
+        if not payload.get("ok"):
+            return None, str(payload.get("error") or "Google Drive archive rejected the upload.")
+        return payload, ""
+    except Exception as exc:
+        return None, f"Google Drive archive failed: {exc}"
+
+
+def archive_completed_jobs(jobs: list[dict], token: str, progress_callback=None) -> tuple[list[dict], dict]:
+    """Archive every completed image/video that does not already have a Drive copy."""
+    current = [dict(j) for j in jobs]
+    batch_name = drive_batch_name(current)
+    tasks = []
+    for idx, job in enumerate(current):
+        if job.get("image_status") == "completed" and not job.get("drive_image_id"):
+            tasks.append((idx, "image"))
+        if job.get("video_status") == "completed" and not job.get("drive_video_id"):
+            tasks.append((idx, "video"))
+
+    report = {"uploaded": 0, "existing": 0, "failed": 0, "attempted": len(tasks), "errors": []}
+    for n, (idx, kind) in enumerate(tasks, 1):
+        job = current[idx]
+        if progress_callback:
+            progress_callback(n - 1, len(tasks), kind, job)
+        if kind == "image":
+            data, mime = image_bytes_for_job(job)
+        else:
+            data = download_video_for_job(token, job)
+            mime = "video/mp4"
+        if not data:
+            message = f"Could not retrieve {kind} bytes for {job.get('name') or 'product'}."
+            job[f"drive_{kind}_error"] = message
+            report["failed"] += 1
+            report["errors"].append(message)
+            continue
+
+        description = f"Flow Try-On Factory | Product: {job.get('name') or ''} | Product URL: {job.get('url') or ''} | Media ID: {job.get('image_media_id') if kind == 'image' else job.get('video_media_id') or ''}"
+        payload, error = archive_bytes_to_google_drive(
+            data=data,
+            mime_type=mime,
+            filename=_archive_filename(idx + 1, job, kind),
+            kind=kind,
+            batch_name=batch_name,
+            description=description,
+        )
+        if payload:
+            job[f"drive_{kind}_id"] = str(payload.get("file_id") or "")
+            job[f"drive_{kind}_url"] = str(payload.get("view_url") or payload.get("download_url") or "")
+            job[f"drive_{kind}_download_url"] = str(payload.get("download_url") or "")
+            job[f"drive_{kind}_error"] = None
+            if payload.get("batch_folder_url"):
+                job["drive_batch_folder_url"] = str(payload.get("batch_folder_url"))
+            if payload.get("existing"):
+                report["existing"] += 1
+            else:
+                report["uploaded"] += 1
+        else:
+            job[f"drive_{kind}_error"] = error
+            report["failed"] += 1
+            report["errors"].append(error)
+        if progress_callback:
+            progress_callback(n, len(tasks), kind, job)
+    return current, report
+
+
 def push_jobs_to_google_sheet(jobs: list[dict], spreadsheet_url: str, worksheet_name: str, mode: str = "Replace tab") -> tuple[bool, str]:
     """Push the current batch to Google Sheets using a service account."""
     info = get_google_service_account_info()
@@ -1152,7 +1313,7 @@ def avatar_library():
 
 def reset_generated(job: dict) -> dict:
     job = dict(job)
-    for key in ["flow_product_ref_ids", "ref_signature", "image_status", "image_job_id", "image_media_id", "image_url", "image_encoded", "image_seed", "image_error", "approved", "video_status", "video_job_id", "video_submitted_at", "video_url", "video_media_id", "video_error", "thumbnail_url"]:
+    for key in ["flow_product_ref_ids", "ref_signature", "image_status", "image_job_id", "image_media_id", "image_url", "image_encoded", "image_seed", "image_error", "approved", "video_status", "video_job_id", "video_submitted_at", "video_url", "video_media_id", "video_error", "thumbnail_url", "drive_image_id", "drive_image_url", "drive_image_download_url", "drive_image_error", "drive_video_id", "drive_video_url", "drive_video_download_url", "drive_video_error", "drive_batch_folder_url"]:
         job.pop(key, None)
     job.update({"image_status": "pending", "approved": False, "video_status": "pending"})
     return job
@@ -1591,6 +1752,7 @@ def main():
     flow_email = get_secret("GOOGLE_FLOW_EMAIL")
     region = get_secret("SOCIAVAULT_REGION", "US") or "US"
     default_google_sheet_url = get_secret("GOOGLE_SHEET_URL")
+    drive_archive_cfg = get_drive_archive_config()
 
     # ---------------- Sidebar: setup only ----------------
     avatar_bytes = None
@@ -1610,6 +1772,10 @@ def main():
         )
         st.markdown(
             f"<div class='connection-row'><strong><span class='{'dot-ok' if social_token else 'dot-warn'}'></span>SociaVault</strong><span>{'Ready' if social_token else 'Missing key'}</span></div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f"<div class='connection-row'><strong><span class='{'dot-ok' if drive_archive_cfg['configured'] else 'dot-warn'}'></span>Drive archive</strong><span>{'Ready' if drive_archive_cfg['configured'] else 'Not set up'}</span></div>",
             unsafe_allow_html=True,
         )
         if flow_email:
@@ -1651,6 +1817,12 @@ def main():
         run_mode = st.radio("Pipeline", ["Review images first", "Full auto"])
         scene = st.selectbox("Mirror setting", list(SCENES.keys()), index=0)
         st.caption("Nano Banana 2 · 9:16\n\nOmni 1.1 Flash · 8s · 720p")
+        auto_archive = st.checkbox(
+            "Auto-archive completed media to Drive",
+            value=bool(drive_archive_cfg.get("auto")),
+            disabled=not bool(drive_archive_cfg.get("configured")),
+            help="Uploads each completed generated image/video to your permanent Google Drive archive. Google Sheet exports then use those Drive links too.",
+        )
 
         if st.session_state.get("jobs"):
             st.divider()
@@ -1874,6 +2046,10 @@ def main():
                     progress.progress(done / max(1, len(indices)), text=f"Images {done}/{len(indices)}")
             for idx, update in updates.items():
                 jobs[idx] = update
+            if auto_archive and drive_archive_cfg.get("configured"):
+                jobs, _ = archive_completed_jobs(jobs, token)
+                if default_google_sheet_url:
+                    push_jobs_to_google_sheet(jobs, default_google_sheet_url, "Flow Try-On", "Replace tab")
             st.session_state["jobs"] = jobs
 
             if run_full or run_mode == "Full auto":
@@ -1943,6 +2119,17 @@ def main():
 
             for idx in pending:
                 current[idx] = refresh_one_video(current[idx], token)
+            if auto_archive and drive_archive_cfg.get("configured"):
+                newly_complete = any(
+                    (j.get("image_status") == "completed" and not j.get("drive_image_id"))
+                    or (j.get("video_status") == "completed" and not j.get("drive_video_id"))
+                    for j in current
+                )
+                if newly_complete:
+                    current, _archive_report = archive_completed_jobs(current, token)
+                    # Keep the connected Sheet fresh with permanent Drive links.
+                    if default_google_sheet_url:
+                        push_jobs_to_google_sheet(current, default_google_sheet_url, "Flow Try-On", "Replace tab")
             st.session_state["jobs"] = current
 
             active_rows = []
@@ -2004,6 +2191,13 @@ def main():
         avatar_id = st.session_state.get("avatar_flow_id", "")
         updated = render_job_result(jobs[result_index], result_index, token, flow_email, avatar_id, scene)
         jobs[result_index] = updated
+        if auto_archive and drive_archive_cfg.get("configured") and (
+            (updated.get("image_status") == "completed" and not updated.get("drive_image_id"))
+            or (updated.get("video_status") == "completed" and not updated.get("drive_video_id"))
+        ):
+            jobs, _ = archive_completed_jobs(jobs, token)
+            if default_google_sheet_url:
+                push_jobs_to_google_sheet(jobs, default_google_sheet_url, "Flow Try-On", "Replace tab")
         st.session_state["jobs"] = jobs
 
         st.write("")
@@ -2054,6 +2248,46 @@ def main():
                     mime="application/zip",
                     use_container_width=True,
                 )
+
+            st.divider()
+            st.markdown("<div class='panel-title'>Permanent Google Drive archive</div>", unsafe_allow_html=True)
+            st.markdown("<div class='panel-sub'>Copies completed try-on images and MP4s into your own Google Drive so they do not depend on expiring Flow/CDN links. Existing filenames are reused instead of duplicated.</div>", unsafe_allow_html=True)
+            archived_images = sum(1 for j in jobs if j.get("drive_image_id"))
+            archived_videos = sum(1 for j in jobs if j.get("drive_video_id"))
+            completed_media = sum(1 for j in jobs if j.get("image_status") == "completed") + sum(1 for j in jobs if j.get("video_status") == "completed")
+            archived_media = archived_images + archived_videos
+            d1, d2, d3 = st.columns([1, 1, 2])
+            d1.metric("Drive images", archived_images)
+            d2.metric("Drive videos", archived_videos)
+            folder_url = next((j.get("drive_batch_folder_url") for j in jobs if j.get("drive_batch_folder_url")), "")
+            if folder_url:
+                d3.link_button("Open batch folder in Google Drive", folder_url, use_container_width=True)
+            elif drive_archive_cfg.get("configured"):
+                d3.caption(f"{archived_media}/{completed_media} completed media files archived")
+            else:
+                d3.caption("Drive archive is not configured yet.")
+
+            if st.button(
+                "☁ Archive completed media now",
+                type="primary",
+                use_container_width=True,
+                disabled=not bool(drive_archive_cfg.get("configured")) or completed_media == 0,
+            ):
+                bar = st.progress(0, text="Preparing Google Drive archive…")
+                def _archive_progress(done, total, kind, job):
+                    if total:
+                        bar.progress(done / total, text=f"Archiving {done}/{total} · {kind} · {_short_title(job.get('name'), 40)}")
+                with st.spinner("Copying completed media into your Google Drive…"):
+                    jobs, archive_report = archive_completed_jobs(jobs, token, _archive_progress)
+                    st.session_state["jobs"] = jobs
+                    sheet_message = ""
+                    if default_google_sheet_url:
+                        ok_sheet, sheet_message = push_jobs_to_google_sheet(jobs, default_google_sheet_url, "Flow Try-On", "Replace tab")
+                if archive_report.get("failed"):
+                    st.warning(f"Drive archive: {archive_report.get('uploaded', 0)} uploaded, {archive_report.get('existing', 0)} already existed, {archive_report.get('failed', 0)} failed. " + (archive_report.get("errors") or [""])[0])
+                else:
+                    st.success(f"Drive archive ready · {archive_report.get('uploaded', 0)} new file(s), {archive_report.get('existing', 0)} already archived." + (" Google Sheet updated with permanent Drive links." if default_google_sheet_url else ""))
+                st.rerun()
 
             st.divider()
             st.markdown("<div class='panel-title'>Google Sheets</div>", unsafe_allow_html=True)

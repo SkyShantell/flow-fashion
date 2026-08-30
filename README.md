@@ -80,3 +80,34 @@ This UI version automatically polls async Omni 1.1 Flash jobs after submission. 
 5. In the app's Results → Export batch → Google Sheets section, paste the Sheet URL and press **Push batch to Google Sheet**.
 
 Use **Replace tab** to keep one current batch snapshot, or **Append rows** to build a running log.
+
+## R10 permanent Google Drive archive
+
+R10 adds durable Google Drive copies of completed generated images and videos. This is separate from the Google Sheets service-account integration because Google service accounts do not have normal My Drive storage quota. For ordinary My Drive, R10 uses the included `google_drive_archiver.gs` Apps Script web app, which runs as your Google account and saves the files into a folder you own.
+
+### What R10 does
+- Automatically archives each completed generated image and completed MP4 when Drive archiving is configured and the sidebar toggle is on.
+- Adds a manual **Archive completed media now** recovery/retry button in Results.
+- Uses deterministic filenames and folders, so retries do not create duplicate files.
+- Adds permanent Drive image/video links and Drive file IDs to CSV and Google Sheets exports.
+- When `GOOGLE_SHEET_URL` is configured, automatic archive completion refreshes the `Flow Try-On` worksheet with the permanent Drive links.
+- Adds an **Open batch folder in Google Drive** button after the first successful archive.
+- Keeps the local full-batch ZIP workflow unchanged.
+
+### Google Drive archive setup
+1. In Google Drive, create a folder such as `Flow Try-On Archive`. Copy the folder ID from its URL.
+2. Go to `script.google.com`, create a new Apps Script project, and replace the default code with the contents of `google_drive_archiver.gs`.
+3. In Apps Script → Project Settings → Script Properties, add:
+   - `ARCHIVE_FOLDER_ID` = your Drive folder ID
+   - `ARCHIVE_SECRET` = a long random secret you choose
+4. Deploy → New deployment → Web app:
+   - Execute as: **Me**
+   - Who has access: **Anyone**
+5. Authorize the script when Google asks. Copy the `/exec` deployment URL.
+6. In Streamlit Secrets add:
+   - `GOOGLE_DRIVE_ARCHIVE_WEBHOOK_URL = ".../exec"`
+   - `GOOGLE_DRIVE_ARCHIVE_SECRET = "the exact same secret"`
+   - `GOOGLE_DRIVE_AUTO_ARCHIVE = "true"`
+7. Redeploy/restart Streamlit. The sidebar should show **Drive archive · Ready**.
+
+The shared secret is required because the Apps Script web app must accept server-to-server requests from Streamlit. Do not publish that secret or commit it to GitHub.
