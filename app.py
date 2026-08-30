@@ -319,6 +319,8 @@ def flow_resolve_asset_url(token: str, media_id: str) -> str:
 
 
 def parse_video_job(payload: dict, token: str) -> dict:
+    # Keep status polling lightweight. Do NOT resolve/download the MP4 here;
+    # doing that during every Streamlit rerun can make the UI appear frozen.
     status = str(payload.get("status") or "unknown").lower()
     result = {"status": status}
     if status == "failed":
@@ -328,13 +330,9 @@ def parse_video_job(payload: dict, token: str) -> dict:
     media = response.get("media") or []
     if media:
         item = media[0] or {}
-        media_id = item.get("mediaGenerationId")
-        video_url = item.get("videoUrl")
-        if status == "completed" and not video_url and media_id:
-            video_url = flow_resolve_asset_url(token, media_id)
         result.update({
-            "video_url": video_url,
-            "video_media_id": media_id,
+            "video_url": item.get("videoUrl") or "",
+            "video_media_id": item.get("mediaGenerationId") or "",
             "thumbnail_url": item.get("thumbnailUrl"),
         })
     return result
@@ -346,29 +344,54 @@ def download_url(url: str, timeout: int = 90) -> tuple[bytes, str]:
     return resp.content, (resp.headers.get("Content-Type") or "application/octet-stream").split(";")[0]
 
 
-def download_video(token: str, job: dict) -> bytes | None:
-    url = job.get("video_url")
-    if url:
+def resolve_video_url(token: str, media_id: str) -> tuple[str, str]:
+    """Return (signed_url, message). Fast, explicit action only."""
+    if not media_id:
+        return "", "No video media ID is available yet."
+    try:
+        resp = requests.get(
+            f"{FLOW_BASE}/assets/{quote(media_id, safe='')}",
+            headers=flow_headers(token),
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            payload = resp.json() if resp.content else {}
+            return str(payload.get("url") or ""), ""
+        if resp.status_code == 503:
+            wait = resp.headers.get("Retry-After") or "a few"
+            return "", f"Video exists but its signed URL is not ready yet. Try again in {wait} seconds."
         try:
-            data, _ = download_url(url, 120)
-            if data:
-                return data
+            detail = resp.json().get("error")
         except Exception:
-            pass
-    media_id = job.get("video_media_id")
-    if media_id:
+            detail = resp.text[:300]
+        return "", detail or f"Could not resolve video URL (HTTP {resp.status_code})."
+    except Exception as exc:
+        return "", f"Could not resolve video URL: {exc}"
+
+
+def download_video_raw(token: str, media_id: str) -> tuple[bytes | None, str]:
+    """Fetch MP4 bytes through useapi raw fallback only when user asks."""
+    if not media_id:
+        return None, "No video media ID is available yet."
+    try:
+        resp = requests.get(
+            f"{FLOW_BASE}/assets/{quote(media_id, safe='')}",
+            params={"raw": "true"},
+            headers=flow_headers(token),
+            timeout=180,
+        )
+        if resp.status_code == 200 and resp.content:
+            return resp.content, ""
+        if resp.status_code == 503:
+            wait = resp.headers.get("Retry-After") or "a few"
+            return None, f"Google is still preparing this MP4. Try again in {wait} seconds."
         try:
-            resp = requests.get(
-                f"{FLOW_BASE}/assets/{quote(media_id, safe='')}",
-                params={"raw": "true"},
-                headers=flow_headers(token),
-                timeout=180,
-            )
-            if resp.status_code < 400 and resp.content:
-                return resp.content
+            detail = resp.json().get("error")
         except Exception:
-            pass
-    return None
+            detail = resp.text[:300]
+        return None, detail or f"MP4 fetch failed (HTTP {resp.status_code})."
+    except Exception as exc:
+        return None, f"MP4 fetch failed: {exc}"
 
 
 def image_bytes_from_result(result: dict) -> bytes | None:
@@ -919,25 +942,62 @@ def render_job_result(job: dict, index: int, token: str, email: str, avatar_id: 
             st.markdown("<div class='panel-title'>Motion result</div>", unsafe_allow_html=True)
             st.markdown("<div class='panel-sub'>Omni 1.1 Flash · 8 sec · 720p</div>", unsafe_allow_html=True)
             if job.get("video_status") == "completed":
-                data = download_video(token, job)
-                if data:
-                    st.video(data, format="video/mp4")
-                    dl1, dl2 = st.columns(2)
-                    dl1.download_button(
+                # Never auto-download the MP4 while rendering the page. That was
+                # the source of the long "Opening…"/frozen experience.
+                media_id = job.get("video_media_id") or ""
+                video_url = job.get("video_url") or ""
+                cache_key = f"video_bytes_{job['id']}"
+                cached_data = st.session_state.get(cache_key)
+
+                if video_url:
+                    st.video(video_url)
+                    st.link_button("↗ Open video", video_url, use_container_width=True)
+                elif cached_data:
+                    st.video(cached_data, format="video/mp4")
+                else:
+                    st.success("Video generation completed.")
+                    st.caption("The MP4 is ready in Flow. Load it only when you want to preview/download it.")
+
+                a1, a2 = st.columns(2)
+                if a1.button(
+                    "↻ Get playable link",
+                    key=f"resolve_vid_{job['id']}",
+                    use_container_width=True,
+                    disabled=not bool(media_id),
+                ):
+                    with st.spinner("Getting video link…"):
+                        resolved, message = resolve_video_url(token, media_id)
+                    if resolved:
+                        job["video_url"] = resolved
+                        st.session_state["jobs"][index] = job
+                        st.rerun()
+                    else:
+                        st.warning(message or "Video link is not ready yet.")
+
+                if a2.button(
+                    "↓ Prepare MP4",
+                    key=f"prepare_vid_{job['id']}",
+                    use_container_width=True,
+                    disabled=not bool(media_id),
+                ):
+                    with st.spinner("Fetching MP4…"):
+                        data, message = download_video_raw(token, media_id)
+                    if data:
+                        st.session_state[cache_key] = data
+                        st.rerun()
+                    else:
+                        st.warning(message or "MP4 is not ready yet.")
+
+                cached_data = st.session_state.get(cache_key)
+                if cached_data:
+                    st.download_button(
                         "↓ Download MP4",
-                        data=data,
+                        data=cached_data,
                         file_name=f"{safe_name(job.get('name'))}.mp4",
                         mime="video/mp4",
                         key=f"dl_vid_{job['id']}",
                         use_container_width=True,
                     )
-                    if job.get("video_url"):
-                        dl2.link_button("↗ Open original", job["video_url"], use_container_width=True)
-                elif job.get("video_url"):
-                    st.video(job["video_url"])
-                    st.link_button("↗ Open original video", job["video_url"], use_container_width=True)
-                else:
-                    st.warning("Flow says the video is complete, but the media URL was not returned. Check status once more to resolve the asset.")
             elif job.get("video_status") == "failed":
                 st.error(job.get("video_error") or "Video generation failed")
             elif job.get("video_job_id"):
