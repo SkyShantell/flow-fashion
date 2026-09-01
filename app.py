@@ -1320,12 +1320,27 @@ def image_bytes_for_job(job: dict) -> tuple[bytes | None, str]:
     return None, "image/jpeg"
 
 
+
 def drive_batch_name(jobs: list[dict]) -> str:
-    """Deterministic folder name so a retry/redeploy does not create a new batch."""
-    fingerprint = "|".join(str(j.get("url") or j.get("id") or j.get("name") or "") for j in jobs)
+    # Prefer the durable batch ID so separate runs never merge in Drive.
+    batch_id = next(
+        (
+            str(j.get("_batch_id") or "").strip()
+            for j in jobs
+            if str(j.get("_batch_id") or "").strip()
+        ),
+        "",
+    )
+    if batch_id:
+        return f"Batch {batch_id}"
+
+    # Backward-compatible fallback for older saved state.
+    fingerprint = "|".join(
+        str(j.get("url") or j.get("id") or j.get("name") or "")
+        for j in jobs
+    )
     digest = hashlib.sha1(fingerprint.encode("utf-8")).hexdigest()[:8] if fingerprint else "batch"
     return f"Flow Try-On {digest}"
-
 
 def _archive_filename(index: int, job: dict, kind: str) -> str:
     media_id = str(job.get("image_media_id") if kind == "image" else job.get("video_media_id") or job.get("video_job_id") or "")
@@ -1652,65 +1667,235 @@ def _format_google_sheet(book, ws, headers: list[str], data_rows: int) -> None:
     book.batch_update({"requests": requests_payload})
 
 
-def push_jobs_to_google_sheet(jobs: list[dict], spreadsheet_url: str, worksheet_name: str, mode: str = "Replace tab") -> tuple[bool, str]:
-    """Push the current batch to Google Sheets using a service account."""
+
+def _sheet_col_letter(col_num: int) -> str:
+    col_num = max(1, int(col_num))
+    letters = ""
+    while col_num:
+        col_num, rem = divmod(col_num - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters
+
+
+def _sheet_int(value, default: int = 0) -> int:
+    try:
+        return int(str(value or "").strip())
+    except Exception:
+        return default
+
+
+def _tracker_max_product_number(existing: list[list[str]]) -> int:
+    best = 0
+    for row in existing[1:]:
+        if row:
+            best = max(best, _sheet_int(row[0], 0))
+    return best
+
+
+def _single_job_sheet_row(
+    job: dict,
+    product_number: int,
+    sheet_row: int,
+) -> tuple[list[str], list[str]]:
+    headers, rows = _jobs_sheet_rows([job])
+    row = list(rows[0]) if rows else [""] * len(headers)
+
+    if len(row) < len(headers):
+        row += [""] * (len(headers) - len(row))
+
+    row[0] = str(product_number)
+    row[25] = str(sheet_row)
+    job["sheet_row"] = sheet_row
+    return headers, row
+
+
+def push_jobs_to_google_sheet(
+    jobs: list[dict],
+    spreadsheet_url: str,
+    worksheet_name: str,
+    mode: str = "Append/update tracker",
+) -> tuple[bool, str]:
+    # Non-destructive production tracker:
+    # - jobs with a Sheet row update that row
+    # - new jobs append underneath
+    # - old rows are never cleared unless Replace tab is explicitly selected
+
     info = get_google_service_account_info()
     if not info:
-        return False, "Google Sheets is not configured. Add GOOGLE_SERVICE_ACCOUNT_JSON (or [gcp_service_account]) to Streamlit Secrets."
+        return False, (
+            "Google Sheets is not configured. Add GOOGLE_SERVICE_ACCOUNT_JSON "
+            "(or [gcp_service_account]) to Streamlit Secrets."
+        )
+
     try:
         import gspread
     except Exception:
-        return False, "Google Sheets dependency is missing. Make sure gspread is in requirements.txt and redeploy."
+        return False, (
+            "Google Sheets dependency is missing. Make sure gspread is in "
+            "requirements.txt and redeploy."
+        )
 
     sheet_ref = str(spreadsheet_url or "").strip()
     if not sheet_ref:
         return False, "Paste a Google Sheet URL first."
+
     tab_name = (str(worksheet_name or "Flow Try-On").strip() or "Flow Try-On")[:100]
-    headers, rows = _jobs_sheet_rows(jobs)
-    values = [headers] + rows
+    base_headers, _ = _jobs_sheet_rows([])
+
     try:
         gc = gspread.service_account_from_dict(info)
-        if sheet_ref.startswith("http://") or sheet_ref.startswith("https://"):
+        if sheet_ref.startswith(("http://", "https://")):
             book = gc.open_by_url(sheet_ref)
         else:
             book = gc.open_by_key(sheet_ref)
+
         try:
             ws = book.worksheet(tab_name)
         except gspread.WorksheetNotFound:
-            ws = book.add_worksheet(title=tab_name, rows=max(100, len(values) + 20), cols=max(20, len(headers) + 2))
+            ws = book.add_worksheet(
+                title=tab_name,
+                rows=max(100, len(jobs) + 30),
+                cols=max(30, len(base_headers) + 2),
+            )
+
+        existing = ws.get_all_values()
+
+        # Keep the headers current without touching data rows.
+        ws.update(
+            range_name="A1",
+            values=[base_headers],
+            value_input_option="USER_ENTERED",
+        )
+        if not existing:
+            existing = [base_headers]
+
+        last_col = _sheet_col_letter(len(base_headers))
+        max_product_number = _tracker_max_product_number(existing)
 
         if mode == "Append rows":
-            existing = ws.get_all_values()
-            if not existing:
-                ws.update(range_name="A1", values=[headers])
             start_row = max(len(existing), 1) + 1
+            next_product_number = max_product_number + 1
+            appended_rows = []
+
             for i, job in enumerate(jobs):
-                job["sheet_row"] = start_row + i
-            headers, rows = _jobs_sheet_rows(jobs)
-            if rows:
-                ws.append_rows(rows, value_input_option="USER_ENTERED", insert_data_option="INSERT_ROWS")
-            final_row_count = max(len(existing), 1) + len(rows)
+                headers, row = _single_job_sheet_row(
+                    job,
+                    next_product_number + i,
+                    start_row + i,
+                )
+                appended_rows.append(row)
+
+            if appended_rows:
+                ws.append_rows(
+                    appended_rows,
+                    value_input_option="USER_ENTERED",
+                    insert_data_option="INSERT_ROWS",
+                )
+
+            final_row_count = max(len(existing), 1) + len(appended_rows)
+            rows_saved = len(appended_rows)
+
+        elif mode == "Append/update tracker":
+            next_row = max(len(existing), 1) + 1
+            next_product_number = max_product_number + 1
+            rows_saved = 0
+            highest_row = max(len(existing), 1)
+
+            for job in jobs:
+                requested_row = _sheet_int(job.get("sheet_row"), 0)
+                can_update_existing = 2 <= requested_row <= max(len(existing), 1)
+
+                if can_update_existing:
+                    target_row = requested_row
+                    old = (
+                        existing[target_row - 1]
+                        if target_row - 1 < len(existing)
+                        else []
+                    )
+                    product_number = _sheet_int(
+                        old[0] if old else "",
+                        target_row - 1,
+                    )
+                else:
+                    target_row = next_row
+                    next_row += 1
+                    product_number = next_product_number
+                    next_product_number += 1
+
+                headers, row = _single_job_sheet_row(
+                    job,
+                    product_number,
+                    target_row,
+                )
+
+                if target_row > ws.row_count:
+                    ws.add_rows(max(20, target_row - ws.row_count + 10))
+
+                ws.update(
+                    range_name=f"A{target_row}:{last_col}{target_row}",
+                    values=[row],
+                    value_input_option="USER_ENTERED",
+                )
+
+                while len(existing) < target_row:
+                    existing.append([])
+                existing[target_row - 1] = row
+
+                highest_row = max(highest_row, target_row)
+                rows_saved += 1
+
+            final_row_count = highest_row
+
         else:
+            # Explicit destructive option retained for deliberate use.
             for i, job in enumerate(jobs):
                 job["sheet_row"] = i + 2
+
             headers, rows = _jobs_sheet_rows(jobs)
             values = [headers] + rows
             ws.clear()
-            ws.update(range_name="A1", values=values, value_input_option="USER_ENTERED")
+            ws.update(
+                range_name="A1",
+                values=values,
+                value_input_option="USER_ENTERED",
+            )
             final_row_count = len(rows) + 1
+            rows_saved = len(rows)
 
-        # Formatting is best-effort: a data push should still succeed even if Google rejects a visual setting.
         format_warning = ""
         try:
-            _format_google_sheet(book, ws, headers, max(0, final_row_count - 1))
+            _format_google_sheet(
+                book,
+                ws,
+                base_headers,
+                max(0, final_row_count - 1),
+            )
         except Exception as fmt_exc:
-            format_warning = f" Data was saved, but Sheet formatting could not be applied: {fmt_exc}"
+            format_warning = (
+                f" Data was saved, but Sheet formatting could not be applied: {fmt_exc}"
+            )
 
         service_email = str(info.get("client_email") or "service account")
-        return True, f"Pushed {len(rows)} product(s) to '{tab_name}' and formatted it for easier reading. Connected as {service_email}.{format_warning}"
+
+        if mode == "Append/update tracker":
+            action_text = (
+                f"Synced {rows_saved} product(s) to '{tab_name}'. "
+                "Older rows were preserved; existing current-batch rows were updated "
+                "and new products were added underneath."
+            )
+        elif mode == "Append rows":
+            action_text = (
+                f"Appended {rows_saved} product(s) beneath the existing rows in '{tab_name}'."
+            )
+        else:
+            action_text = f"Replaced '{tab_name}' with {rows_saved} product(s)."
+
+        return True, (
+            f"{action_text} Connected as {service_email}.{format_warning}"
+        )
+
     except Exception as exc:
         return False, f"Google Sheets push failed: {exc}"
-
 
 def _open_google_book(spreadsheet_url: str):
     info = get_google_service_account_info()
@@ -1868,7 +2053,7 @@ def maybe_sync_batch(jobs: list[dict], spreadsheet_url: str, *, sync_current_tab
     messages = []
     ok_current = True
     if sync_current_tab:
-        ok_current, msg = push_jobs_to_google_sheet(jobs, spreadsheet_url, "Flow Try-On", "Replace tab")
+        ok_current, msg = push_jobs_to_google_sheet(jobs, spreadsheet_url, "Flow Try-On", "Append/update tracker")
         if msg: messages.append(msg)
     ok_history, hist_msg = persist_batch_history_to_google_sheet(jobs, spreadsheet_url)
     if hist_msg: messages.append(hist_msg)
@@ -2545,28 +2730,94 @@ def main():
     # Recovery must stay visible even when there is no imported product batch.
     render_flow_recovery(token, expanded=not bool(st.session_state.get("jobs")))
 
-    # ---------------- Import / replace batch ----------------
+    # ---------------- Import products ----------------
     jobs = st.session_state.get("jobs") or []
-    with st.expander("Import products" if not jobs else "Import or replace batch", expanded=not bool(jobs)):
+    with st.expander(
+        "Import products" if not jobs else "Add products or start a new batch",
+        expanded=not bool(jobs),
+    ):
         st.markdown("<div class='panel-title'>TikTok Shop products</div>", unsafe_allow_html=True)
-        st.markdown("<div class='panel-sub'>Paste one product URL per line. The first 10 valid links are used.</div>", unsafe_allow_html=True)
+
+        import_behavior = "Start new batch"
+        available_slots = MAX_LINKS
+
+        if jobs:
+            import_behavior = st.radio(
+                "Import behavior",
+                ["Add to current batch", "Start new batch"],
+                horizontal=True,
+                key="product_import_behavior",
+                help=(
+                    "Add to current batch keeps the products already open and adds new "
+                    "ones after them. Start new batch replaces only the current workspace; "
+                    "older rows in the Google Sheet tracker are still preserved."
+                ),
+            )
+            if import_behavior == "Add to current batch":
+                available_slots = max(0, MAX_LINKS - len(jobs))
+                st.caption(
+                    f"Current batch: {len(jobs)}/{MAX_LINKS} products · "
+                    f"{available_slots} slot(s) available."
+                )
+            else:
+                available_slots = MAX_LINKS
+        else:
+            st.markdown(
+                "<div class='panel-sub'>Paste one product URL per line. "
+                "The first 10 valid links are used.</div>",
+                unsafe_allow_html=True,
+            )
+
         raw_links = st.text_area(
             "TikTok Shop links",
             height=145,
-            placeholder="https://www.tiktok.com/shop/pdp/...\nhttps://www.tiktok.com/shop/pdp/...",
+            placeholder=(
+                "https://www.tiktok.com/shop/pdp/...\n"
+                "https://www.tiktok.com/shop/pdp/..."
+            ),
             label_visibility="collapsed",
         )
-        raw_count = len([x for x in raw_links.splitlines() if x.strip()])
-        links = dedupe([x.strip() for x in raw_links.splitlines() if x.strip() and not x.strip().startswith("#")])[:MAX_LINKS]
-        if raw_count > MAX_LINKS:
-            st.warning(f"Only the first {MAX_LINKS} links will be processed.")
 
-        if st.button("Import products with SociaVault", type="primary", use_container_width=True, disabled=not bool(links)):
+        raw_count = len([x for x in raw_links.splitlines() if x.strip()])
+        cleaned_links = dedupe(
+            [
+                x.strip()
+                for x in raw_links.splitlines()
+                if x.strip() and not x.strip().startswith("#")
+            ]
+        )
+        links = cleaned_links[:available_slots]
+
+        if raw_count > available_slots:
+            if jobs and import_behavior == "Add to current batch":
+                st.warning(
+                    f"This batch has room for {available_slots} more product(s). "
+                    "Extra links will not be imported."
+                )
+            else:
+                st.warning(f"Only the first {MAX_LINKS} links will be processed.")
+
+        import_disabled = not bool(links) or available_slots <= 0
+
+        if st.button(
+            "Add products with SociaVault"
+            if jobs and import_behavior == "Add to current batch"
+            else "Import products with SociaVault",
+            type="primary",
+            use_container_width=True,
+            disabled=import_disabled,
+        ):
             imported = []
             errors = []
             progress = st.progress(0, text="Importing products...")
-            with ThreadPoolExecutor(max_workers=min(IMPORT_WORKERS, len(links))) as ex:
-                future_map = {ex.submit(import_product, link, social_token, region): link for link in links}
+
+            with ThreadPoolExecutor(
+                max_workers=min(IMPORT_WORKERS, len(links))
+            ) as ex:
+                future_map = {
+                    ex.submit(import_product, link, social_token, region): link
+                    for link in links
+                }
                 done = 0
                 for fut in as_completed(future_map):
                     link = future_map[fut]
@@ -2575,19 +2826,47 @@ def main():
                     except Exception as exc:
                         errors.append((link, str(exc)))
                     done += 1
-                    progress.progress(done / len(links), text=f"Imported {done}/{len(links)}")
+                    progress.progress(
+                        done / len(links),
+                        text=f"Imported {done}/{len(links)}",
+                    )
+
             by_url = {j["url"]: j for j in imported}
-            new_jobs = [by_url[x] for x in links if x in by_url]
-            ensure_batch_metadata(new_jobs, force_new=True)
+            imported_in_input_order = [
+                by_url[x] for x in links if x in by_url
+            ]
+
+            if jobs and import_behavior == "Add to current batch":
+                existing_urls = {
+                    str(j.get("url") or "").strip()
+                    for j in jobs
+                    if str(j.get("url") or "").strip()
+                }
+                additions = [
+                    j
+                    for j in imported_in_input_order
+                    if str(j.get("url") or "").strip() not in existing_urls
+                ]
+                new_jobs = list(jobs) + additions
+
+                # Keep current batch identity and existing Sheet row assignments.
+                ensure_batch_metadata(new_jobs)
+            else:
+                new_jobs = imported_in_input_order
+                ensure_batch_metadata(new_jobs, force_new=True)
+
             if auto_archive and drive_archive_cfg.get("configured") and new_jobs:
                 with st.spinner("Archiving selected product references to Drive…"):
                     new_jobs, _ = archive_completed_jobs(new_jobs, token)
+
             st.session_state["jobs"] = new_jobs
             st.session_state.pop("batch_history_cache", None)
             st.session_state.pop("videos_zip", None)
             st.session_state.pop("full_batch_zip", None)
+
             if errors:
                 st.session_state["import_errors"] = errors
+
             st.rerun()
 
     if st.session_state.get("import_errors"):
@@ -3023,9 +3302,9 @@ def main():
             d1.metric("References", f"{archived_refs}/{total_refs}")
             d2.metric("Drive images", archived_images)
             d3.metric("Drive videos", archived_videos)
-            folder_url = next((j.get("drive_product_folder_url") or j.get("drive_batch_folder_url") for j in jobs if j.get("drive_product_folder_url") or j.get("drive_batch_folder_url")), "")
+            folder_url = next((j.get("drive_batch_folder_url") for j in jobs if j.get("drive_batch_folder_url")), "")
             if folder_url:
-                d4.link_button("Open first product folder in Google Drive", folder_url, use_container_width=True)
+                d4.link_button("Open this batch folder in Google Drive", folder_url, use_container_width=True)
             elif drive_archive_cfg.get("configured"):
                 d4.caption(f"{archived_media}/{archivable_total} reference/generated files archived")
             else:
@@ -3065,7 +3344,7 @@ def main():
             )
             tab_name = gs2.text_input("Worksheet/tab", value="Flow Try-On", key="google_sheet_tab")
             gs3, gs4 = st.columns([1, 2])
-            push_mode = gs3.selectbox("Push mode", ["Replace tab", "Append rows"], key="google_sheet_mode")
+            push_mode = gs3.selectbox("Push mode", ["Append rows", "Replace tab"], key="google_sheet_mode")
             service_info = get_google_service_account_info()
             if service_info and service_info.get("client_email"):
                 gs4.caption(f"Share the Sheet with: {service_info.get('client_email')} · Editor")
