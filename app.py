@@ -2581,6 +2581,314 @@ def render_flow_recovery(token: str, expanded: bool = False) -> None:
                 st.info("This job is still queued/processing. Press Check / refresh recovered jobs above to update it.")
 
 
+# R14_SCANNER_QUEUE_START
+SCANNER_QUEUE_TAB = "Scanner Queue"
+
+
+def _scanner_queue_open():
+    info = get_google_service_account_info()
+    sheet_ref = str(get_secret("GOOGLE_SHEET_URL") or "").strip()
+    if not info or not sheet_ref:
+        return None, None, "Google Sheets is not configured."
+
+    try:
+        import gspread
+    except Exception:
+        return None, None, "gspread is missing from requirements.txt."
+
+    try:
+        gc = gspread.service_account_from_dict(info)
+        if sheet_ref.startswith(("http://", "https://")):
+            book = gc.open_by_url(sheet_ref)
+        else:
+            book = gc.open_by_key(sheet_ref)
+        try:
+            ws = book.worksheet(SCANNER_QUEUE_TAB)
+        except gspread.WorksheetNotFound:
+            return None, gspread, ""
+        return ws, gspread, ""
+    except Exception as exc:
+        return None, gspread, str(exc)
+
+
+def _scanner_queue_pending():
+    ws, _gspread, error = _scanner_queue_open()
+    if error:
+        return [], ws, error
+    if ws is None:
+        return [], None, ""
+
+    try:
+        values = ws.get_all_values()
+    except Exception as exc:
+        return [], ws, str(exc)
+
+    if len(values) < 2:
+        return [], ws, ""
+
+    headers = values[0]
+    rows = []
+    for row_num, raw in enumerate(values[1:], start=2):
+        padded = raw + [""] * max(0, len(headers) - len(raw))
+        rec = dict(zip(headers, padded))
+        rec["_row_num"] = row_num
+
+        status = str(rec.get("Status") or "Pending").strip().lower()
+        link = str(rec.get("Product Link") or "").strip()
+        if status in {"", "pending", "queued"} and link:
+            rows.append(rec)
+
+    def _n(value):
+        try:
+            return int(float(str(value or "0").replace(",", "")))
+        except Exception:
+            return 0
+
+    rows.sort(
+        key=lambda r: (
+            _n(r.get("Creator Count")),
+            _n(r.get("Video Count")),
+            _n(r.get("Combined Views")),
+        ),
+        reverse=True,
+    )
+    return rows, ws, ""
+
+
+def _scanner_queue_mark_imported(ws, records, batch_id):
+    if ws is None or not records:
+        return
+
+    imported_at = _utc_now_iso()
+    for rec in records:
+        row_num = int(rec.get("_row_num") or 0)
+        if row_num < 2:
+            continue
+        ws.update(
+            range_name=f"J{row_num}:L{row_num}",
+            values=[["Imported", imported_at, batch_id]],
+            value_input_option="USER_ENTERED",
+        )
+
+
+def render_scanner_queue_import(
+    social_token: str,
+    region: str,
+    token: str,
+    auto_archive: bool,
+    drive_archive_cfg: dict,
+) -> None:
+    pending, ws, queue_error = _scanner_queue_pending()
+
+    if queue_error:
+        with st.expander("Import from Creator Scanner", expanded=False):
+            st.warning(f"Scanner Queue could not be read: {queue_error}")
+        return
+
+    pending_count = len(pending)
+    label = (
+        f"Import from Creator Scanner · {pending_count} waiting"
+        if pending_count
+        else "Import from Creator Scanner"
+    )
+
+    with st.expander(label, expanded=False):
+        st.markdown("<div class='panel-title'>Creator Scanner queue</div>", unsafe_allow_html=True)
+        st.markdown(
+            "<div class='panel-sub'>Select products already found by the Creator Scanner. "
+            "Flow Fashion will pull the full product details and photos with SociaVault.</div>",
+            unsafe_allow_html=True,
+        )
+
+        if not pending:
+            st.info("No pending products are waiting in Scanner Queue.")
+            return
+
+        current_jobs = list(st.session_state.get("jobs") or [])
+
+        behavior = st.radio(
+            "Scanner import behavior",
+            ["Add to current batch", "Start new batch"],
+            horizontal=True,
+            key="scanner_queue_behavior",
+        )
+
+        if behavior == "Add to current batch":
+            available = max(0, MAX_LINKS - len(current_jobs))
+            st.caption(
+                f"Current batch: {len(current_jobs)}/{MAX_LINKS} products · "
+                f"{available} slot(s) available."
+            )
+        else:
+            available = MAX_LINKS
+            st.caption(f"New batch capacity: {MAX_LINKS} products.")
+
+        table = [{
+            "Import": False,
+            "Product": rec.get("Product Name", ""),
+            "Creators": rec.get("Creators", ""),
+            "Creator Count": rec.get("Creator Count", ""),
+            "Video Count": rec.get("Video Count", ""),
+            "Views": rec.get("Combined Views", ""),
+            "Product Link": rec.get("Product Link", ""),
+        } for rec in pending]
+
+        edited = st.data_editor(
+            table,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Import": st.column_config.CheckboxColumn("Import", default=False),
+                "Product Link": st.column_config.LinkColumn("Product Link"),
+            },
+            disabled=[
+                "Product", "Creators", "Creator Count",
+                "Video Count", "Views", "Product Link",
+            ],
+            key="scanner_queue_main_editor",
+        )
+
+        selected_indexes = []
+        if hasattr(edited, "iterrows"):
+            for i, (_, row) in enumerate(edited.iterrows()):
+                if bool(row.get("Import")):
+                    selected_indexes.append(i)
+        elif isinstance(edited, list):
+            for i, row in enumerate(edited):
+                if isinstance(row, dict) and bool(row.get("Import")):
+                    selected_indexes.append(i)
+
+        if len(selected_indexes) > available:
+            st.warning(
+                f"You selected {len(selected_indexes)}, but only {available} slot(s) are available."
+            )
+
+        selected = [
+            pending[i]
+            for i in selected_indexes[:available]
+            if 0 <= i < len(pending)
+        ]
+
+        button_text = (
+            f"Add {len(selected)} selected to current batch"
+            if behavior == "Add to current batch"
+            else f"Start new batch with {len(selected)} selected"
+        )
+
+        if st.button(
+            button_text,
+            type="primary",
+            use_container_width=True,
+            key="scanner_queue_import_button",
+            disabled=(
+                not selected
+                or available <= 0
+                or len(selected_indexes) > available
+            ),
+        ):
+            imported = []
+            successful_queue_rows = []
+            errors = []
+
+            progress = st.progress(
+                0,
+                text="Importing Scanner products with SociaVault…",
+            )
+
+            with ThreadPoolExecutor(
+                max_workers=min(IMPORT_WORKERS, len(selected))
+            ) as ex:
+                future_map = {
+                    ex.submit(
+                        import_product,
+                        str(rec.get("Product Link") or "").strip(),
+                        social_token,
+                        region,
+                    ): rec
+                    for rec in selected
+                }
+
+                done = 0
+                for fut in as_completed(future_map):
+                    rec = future_map[fut]
+                    try:
+                        imported.append(fut.result())
+                        successful_queue_rows.append(rec)
+                    except Exception as exc:
+                        errors.append((rec, str(exc)))
+
+                    done += 1
+                    progress.progress(
+                        done / len(selected),
+                        text=f"Imported {done}/{len(selected)}",
+                    )
+
+            if behavior == "Add to current batch":
+                existing_urls = {
+                    str(j.get("url") or "").strip()
+                    for j in current_jobs
+                    if str(j.get("url") or "").strip()
+                }
+                additions = [
+                    j for j in imported
+                    if str(j.get("url") or "").strip() not in existing_urls
+                ]
+                new_jobs = current_jobs + additions
+                batch_id, _ = ensure_batch_metadata(new_jobs)
+            else:
+                new_jobs = imported[:MAX_LINKS]
+                batch_id, _ = ensure_batch_metadata(
+                    new_jobs,
+                    force_new=True,
+                )
+
+            if auto_archive and drive_archive_cfg.get("configured") and new_jobs:
+                with st.spinner(
+                    "Archiving selected product references to Drive…"
+                ):
+                    new_jobs, _ = archive_completed_jobs(
+                        new_jobs,
+                        token,
+                    )
+
+            st.session_state["jobs"] = new_jobs
+            st.session_state.pop("batch_history_cache", None)
+            st.session_state.pop("videos_zip", None)
+            st.session_state.pop("full_batch_zip", None)
+
+            if successful_queue_rows:
+                try:
+                    _scanner_queue_mark_imported(
+                        ws,
+                        successful_queue_rows,
+                        batch_id,
+                    )
+                except Exception as exc:
+                    st.session_state["scanner_queue_warning"] = (
+                        "Products imported, but queue status could not be "
+                        f"updated: {exc}"
+                    )
+
+            if errors:
+                st.session_state["scanner_queue_errors"] = [
+                    (
+                        str(
+                            rec.get("Product Name")
+                            or rec.get("Product Link")
+                            or "Product"
+                        ),
+                        err,
+                    )
+                    for rec, err in errors
+                ]
+
+            st.session_state["scanner_queue_success"] = (
+                f"Imported {len(imported)} Scanner product(s) into Flow Fashion."
+            )
+            st.rerun()
+# R14_SCANNER_QUEUE_END
+
+
 def main():
     st.set_page_config(page_title=APP_NAME, page_icon="🪞", layout="wide", initial_sidebar_state="expanded")
     inject_css()
@@ -2730,6 +3038,23 @@ def main():
     # Recovery must stay visible even when there is no imported product batch.
     render_flow_recovery(token, expanded=not bool(st.session_state.get("jobs")))
 
+
+
+    if st.session_state.get("scanner_queue_success"):
+        st.success(st.session_state.pop("scanner_queue_success"))
+    if st.session_state.get("scanner_queue_warning"):
+        st.warning(st.session_state.pop("scanner_queue_warning"))
+    if st.session_state.get("scanner_queue_errors"):
+        for _name, _error in st.session_state.pop("scanner_queue_errors"):
+            st.warning(f"Could not import {_name} — {_error}")
+
+    render_scanner_queue_import(
+        social_token=social_token,
+        region=region,
+        token=token,
+        auto_archive=auto_archive,
+        drive_archive_cfg=drive_archive_cfg,
+    )
     # ---------------- Import products ----------------
     jobs = st.session_state.get("jobs") or []
     with st.expander(
