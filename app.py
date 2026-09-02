@@ -2801,6 +2801,274 @@ def render_flow_recovery(token: str, expanded: bool = False) -> None:
                 st.info("This job is still queued/processing. Press Check / refresh recovered jobs above to update it.")
 
 
+
+# R13_SCANNER_QUEUE_START
+SCANNER_QUEUE_TAB = "Scanner Queue"
+
+
+def _scanner_queue_open():
+    """Open the Google Sheet tab populated by the Creator Product Scanner."""
+    info = get_google_service_account_info()
+    sheet_ref = str(get_secret("GOOGLE_SHEET_URL") or "").strip()
+    if not info or not sheet_ref:
+        return None, None, "Google Sheets is not configured."
+
+    try:
+        import gspread
+    except Exception:
+        return None, None, "gspread is missing from requirements.txt."
+
+    try:
+        gc = gspread.service_account_from_dict(info)
+        book = gc.open_by_url(sheet_ref) if sheet_ref.startswith(("http://", "https://")) else gc.open_by_key(sheet_ref)
+        try:
+            ws = book.worksheet(SCANNER_QUEUE_TAB)
+        except gspread.WorksheetNotFound:
+            return None, gspread, ""
+        return ws, gspread, ""
+    except Exception as exc:
+        return None, gspread, str(exc)
+
+
+def _queue_get_any(rec: dict, names: list[str], default: str = "") -> str:
+    for name in names:
+        value = str(rec.get(name) or "").strip()
+        if value:
+            return value
+    return default
+
+
+def _scanner_queue_pending():
+    """Return pending scanner rows, sorted by strongest creator/video signal first."""
+    ws, _gspread, error = _scanner_queue_open()
+    if error:
+        return [], ws, error
+    if ws is None:
+        return [], None, ""
+
+    try:
+        values = ws.get_all_values()
+    except Exception as exc:
+        return [], ws, str(exc)
+
+    if len(values) < 2:
+        return [], ws, ""
+
+    headers = values[0]
+    rows = []
+    for row_num, raw in enumerate(values[1:], start=2):
+        padded = raw + [""] * max(0, len(headers) - len(raw))
+        rec = dict(zip(headers, padded))
+        rec["_row_num"] = row_num
+
+        status = _queue_get_any(rec, ["Status", "Queue Status"], "Pending").lower()
+        link = _queue_get_any(rec, ["Product Link", "Product URL", "TikTok Product Link", "URL"])
+        if status in {"", "pending", "queued", "new"} and link:
+            rec["Product Link"] = link
+            rows.append(rec)
+
+    def _n(value):
+        try:
+            return int(float(str(value or "0").replace(",", "")))
+        except Exception:
+            return 0
+
+    rows.sort(
+        key=lambda r: (
+            _n(_queue_get_any(r, ["Creator Count", "Creators Count"])),
+            _n(_queue_get_any(r, ["Video Count", "Videos", "Videos Found"])),
+            _n(_queue_get_any(r, ["Combined Views", "Views", "Total Views"])),
+        ),
+        reverse=True,
+    )
+    return rows, ws, ""
+
+
+def _ensure_queue_columns(ws, required: list[str]) -> dict[str, int]:
+    headers = list(ws.row_values(1))
+    changed = False
+    for name in required:
+        if name not in headers:
+            headers.append(name)
+            changed = True
+    if changed:
+        last_col = _sheet_col_letter(len(headers))
+        ws.update(range_name=f"A1:{last_col}1", values=[headers], value_input_option="USER_ENTERED")
+    return {name: headers.index(name) + 1 for name in required if name in headers}
+
+
+def _scanner_queue_mark_imported(ws, records, batch_id):
+    """Mark selected scanner products as imported without assuming fixed column letters."""
+    if ws is None or not records:
+        return
+    imported_at = _utc_now_iso()
+    cols = _ensure_queue_columns(ws, ["Status", "Imported At", "Batch ID"])
+    for rec in records:
+        row_num = int(rec.get("_row_num") or 0)
+        if row_num < 2:
+            continue
+        ws.update_cell(row_num, cols["Status"], "Imported")
+        ws.update_cell(row_num, cols["Imported At"], imported_at)
+        ws.update_cell(row_num, cols["Batch ID"], batch_id)
+
+
+def render_scanner_queue_import(
+    social_token: str,
+    region: str,
+    token: str,
+    auto_archive: bool,
+    drive_archive_cfg: dict,
+) -> None:
+    """Import product links pushed by the Creator Product Scanner."""
+    pending, ws, queue_error = _scanner_queue_pending()
+
+    if queue_error:
+        with st.expander("Import from Creator Scanner", expanded=False):
+            st.warning(f"Scanner Queue could not be read: {queue_error}")
+        return
+
+    pending_count = len(pending)
+    label = f"Import from Creator Scanner · {pending_count} waiting" if pending_count else "Import from Creator Scanner"
+
+    with st.expander(label, expanded=False):
+        st.markdown("<div class='panel-title'>Creator Scanner queue</div>", unsafe_allow_html=True)
+        st.markdown(
+            "<div class='panel-sub'>Select products already found by the Creator Scanner. "
+            "Flow Try-On will pull the full product details and photos with SociaVault.</div>",
+            unsafe_allow_html=True,
+        )
+
+        if ws is None:
+            st.info("No Scanner Queue tab was found in your connected Google Sheet yet.")
+            return
+        if not pending:
+            st.info("No pending products are waiting in Scanner Queue.")
+            return
+
+        current_jobs = list(st.session_state.get("jobs") or [])
+        behavior = st.radio(
+            "Scanner import behavior",
+            ["Add to current batch", "Start new batch"],
+            horizontal=True,
+            key="scanner_queue_behavior",
+        )
+
+        if behavior == "Add to current batch":
+            available = max(0, MAX_LINKS - len(current_jobs))
+            st.caption(f"Current batch: {len(current_jobs)}/{MAX_LINKS} products · {available} slot(s) available.")
+        else:
+            available = MAX_LINKS
+            st.caption(f"New batch capacity: {MAX_LINKS} products.")
+
+        table = [
+            {
+                "Import": False,
+                "Product": _queue_get_any(rec, ["Product Name", "Product", "Title"]),
+                "Creators": _queue_get_any(rec, ["Creators", "Creator", "Creator Username"]),
+                "Creator Count": _queue_get_any(rec, ["Creator Count", "Creators Count"]),
+                "Video Count": _queue_get_any(rec, ["Video Count", "Videos", "Videos Found"]),
+                "Views": _queue_get_any(rec, ["Combined Views", "Views", "Total Views"]),
+                "Product Link": _queue_get_any(rec, ["Product Link", "Product URL", "TikTok Product Link", "URL"]),
+            }
+            for rec in pending
+        ]
+
+        edited = st.data_editor(
+            table,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Import": st.column_config.CheckboxColumn("Import", default=False),
+                "Product Link": st.column_config.LinkColumn("Product Link"),
+            },
+            disabled=["Product", "Creators", "Creator Count", "Video Count", "Views", "Product Link"],
+            key="scanner_queue_main_editor",
+        )
+
+        selected_indexes = []
+        if hasattr(edited, "iterrows"):
+            for i, (_, row) in enumerate(edited.iterrows()):
+                if bool(row.get("Import")):
+                    selected_indexes.append(i)
+        elif isinstance(edited, list):
+            for i, row in enumerate(edited):
+                if isinstance(row, dict) and bool(row.get("Import")):
+                    selected_indexes.append(i)
+
+        if len(selected_indexes) > available:
+            st.warning(f"You selected {len(selected_indexes)}, but only {available} slot(s) are available.")
+
+        selected = [pending[i] for i in selected_indexes[:available] if 0 <= i < len(pending)]
+        button_text = f"Add {len(selected)} selected to current batch" if behavior == "Add to current batch" else f"Start new batch with {len(selected)} selected"
+
+        if st.button(
+            button_text,
+            type="primary",
+            use_container_width=True,
+            key="scanner_queue_import_button",
+            disabled=not selected or available <= 0 or len(selected_indexes) > available,
+        ):
+            imported = []
+            successful_queue_rows = []
+            errors = []
+            progress = st.progress(0, text="Importing Scanner products with SociaVault…")
+
+            with ThreadPoolExecutor(max_workers=min(IMPORT_WORKERS, len(selected))) as ex:
+                future_map = {
+                    ex.submit(import_product, _queue_get_any(rec, ["Product Link", "Product URL", "TikTok Product Link", "URL"]), social_token, region): rec
+                    for rec in selected
+                }
+                done = 0
+                for fut in as_completed(future_map):
+                    rec = future_map[fut]
+                    try:
+                        job = fut.result()
+                        job["scanner_creators"] = _queue_get_any(rec, ["Creators", "Creator", "Creator Username"])
+                        job["scanner_creator_count"] = _queue_get_any(rec, ["Creator Count", "Creators Count"])
+                        job["scanner_video_count"] = _queue_get_any(rec, ["Video Count", "Videos", "Videos Found"])
+                        job["scanner_combined_views"] = _queue_get_any(rec, ["Combined Views", "Views", "Total Views"])
+                        imported.append(job)
+                        successful_queue_rows.append(rec)
+                    except Exception as exc:
+                        errors.append((rec, str(exc)))
+                    done += 1
+                    progress.progress(done / max(1, len(selected)), text=f"Imported {done}/{len(selected)}")
+
+            if behavior == "Add to current batch":
+                existing_urls = {str(j.get("url") or "").strip() for j in current_jobs if str(j.get("url") or "").strip()}
+                additions = [j for j in imported if str(j.get("url") or "").strip() not in existing_urls]
+                new_jobs = current_jobs + additions
+                batch_id, _ = ensure_batch_metadata(new_jobs)
+            else:
+                new_jobs = imported[:MAX_LINKS]
+                batch_id, _ = ensure_batch_metadata(new_jobs, force_new=True)
+
+            if auto_archive and drive_archive_cfg.get("configured") and new_jobs:
+                with st.spinner("Archiving selected product references to Drive…"):
+                    new_jobs, _ = archive_completed_jobs(new_jobs, token)
+
+            st.session_state["jobs"] = new_jobs
+            st.session_state.pop("batch_history_cache", None)
+            st.session_state.pop("videos_zip", None)
+            st.session_state.pop("full_batch_zip", None)
+
+            if successful_queue_rows:
+                try:
+                    _scanner_queue_mark_imported(ws, successful_queue_rows, batch_id)
+                except Exception as exc:
+                    st.session_state["scanner_queue_warning"] = f"Products imported, but queue status could not be updated: {exc}"
+
+            if errors:
+                st.session_state["scanner_queue_errors"] = [
+                    (_queue_get_any(rec, ["Product Name", "Product", "Product Link", "Product URL"], "Product"), err)
+                    for rec, err in errors
+                ]
+
+            st.session_state["scanner_queue_success"] = f"Imported {len(imported)} Scanner product(s) into Flow Try-On."
+            st.rerun()
+# R13_SCANNER_QUEUE_END
+
+
 def main():
     st.set_page_config(page_title=APP_NAME, page_icon="🪞", layout="wide", initial_sidebar_state="expanded")
     inject_css()
@@ -2965,23 +3233,77 @@ def main():
     # Recovery must stay visible even when there is no imported product batch.
     render_flow_recovery(token, expanded=not bool(st.session_state.get("jobs")))
 
-    # ---------------- Import / replace batch ----------------
+    # ---------------- Scanner queue + import / replace batch ----------------
+    if st.session_state.get("scanner_queue_success"):
+        st.success(st.session_state.pop("scanner_queue_success"))
+    if st.session_state.get("scanner_queue_warning"):
+        st.warning(st.session_state.pop("scanner_queue_warning"))
+    if st.session_state.get("scanner_queue_errors"):
+        for _name, _error in st.session_state.pop("scanner_queue_errors"):
+            st.warning(f"Could not import {_name} — {_error}")
+
+    render_scanner_queue_import(
+        social_token=social_token,
+        region=region,
+        token=token,
+        auto_archive=auto_archive,
+        drive_archive_cfg=drive_archive_cfg,
+    )
+
     jobs = st.session_state.get("jobs") or []
-    with st.expander("Import products" if not jobs else "Import or replace batch", expanded=not bool(jobs)):
+    with st.expander(
+        "Import products" if not jobs else "Add products or start a new batch",
+        expanded=not bool(jobs),
+    ):
         st.markdown("<div class='panel-title'>TikTok Shop products</div>", unsafe_allow_html=True)
-        st.markdown("<div class='panel-sub'>Paste one product URL per line. The first 10 valid links are used.</div>", unsafe_allow_html=True)
+
+        import_behavior = "Start new batch"
+        available_slots = MAX_LINKS
+
+        if jobs:
+            import_behavior = st.radio(
+                "Import behavior",
+                ["Add to current batch", "Start new batch"],
+                horizontal=True,
+                key="product_import_behavior",
+                help=(
+                    "Add to current batch keeps the products already open and adds new "
+                    "ones after them. Start new batch replaces only the current workspace; "
+                    "older rows in the Google Sheet tracker are still preserved."
+                ),
+            )
+            if import_behavior == "Add to current batch":
+                available_slots = max(0, MAX_LINKS - len(jobs))
+                st.caption(f"Current batch: {len(jobs)}/{MAX_LINKS} products · {available_slots} slot(s) available.")
+            else:
+                available_slots = MAX_LINKS
+        else:
+            st.markdown(
+                "<div class='panel-sub'>Paste one product URL per line. The first 10 valid links are used.</div>",
+                unsafe_allow_html=True,
+            )
+
         raw_links = st.text_area(
             "TikTok Shop links",
             height=145,
             placeholder="https://www.tiktok.com/shop/pdp/...\nhttps://www.tiktok.com/shop/pdp/...",
             label_visibility="collapsed",
         )
-        raw_count = len([x for x in raw_links.splitlines() if x.strip()])
-        links = dedupe([x.strip() for x in raw_links.splitlines() if x.strip() and not x.strip().startswith("#")])[:MAX_LINKS]
-        if raw_count > MAX_LINKS:
-            st.warning(f"Only the first {MAX_LINKS} links will be processed.")
 
-        if st.button("Import products with SociaVault", type="primary", use_container_width=True, disabled=not bool(links)):
+        raw_count = len([x for x in raw_links.splitlines() if x.strip()])
+        cleaned_links = dedupe([x.strip() for x in raw_links.splitlines() if x.strip() and not x.strip().startswith("#")])
+        links = cleaned_links[:available_slots]
+
+        if raw_count > available_slots:
+            if jobs and import_behavior == "Add to current batch":
+                st.warning(f"This batch has room for {available_slots} more product(s). Extra links will not be imported.")
+            else:
+                st.warning(f"Only the first {MAX_LINKS} links will be processed.")
+
+        import_disabled = not bool(links) or available_slots <= 0
+        button_label = "Add products with SociaVault" if jobs and import_behavior == "Add to current batch" else "Import products with SociaVault"
+
+        if st.button(button_label, type="primary", use_container_width=True, disabled=import_disabled):
             imported = []
             errors = []
             progress = st.progress(0, text="Importing products...")
@@ -2996,12 +3318,23 @@ def main():
                         errors.append((link, str(exc)))
                     done += 1
                     progress.progress(done / len(links), text=f"Imported {done}/{len(links)}")
+
             by_url = {j["url"]: j for j in imported}
-            new_jobs = [by_url[x] for x in links if x in by_url]
-            ensure_batch_metadata(new_jobs, force_new=True)
+            imported_in_input_order = [by_url[x] for x in links if x in by_url]
+
+            if jobs and import_behavior == "Add to current batch":
+                existing_urls = {str(j.get("url") or "").strip() for j in jobs if str(j.get("url") or "").strip()}
+                additions = [j for j in imported_in_input_order if str(j.get("url") or "").strip() not in existing_urls]
+                new_jobs = list(jobs) + additions
+                ensure_batch_metadata(new_jobs)
+            else:
+                new_jobs = imported_in_input_order
+                ensure_batch_metadata(new_jobs, force_new=True)
+
             if auto_archive and drive_archive_cfg.get("configured") and new_jobs:
                 with st.spinner("Archiving selected product references to Drive…"):
                     new_jobs, _ = archive_completed_jobs(new_jobs, token)
+
             st.session_state["jobs"] = new_jobs
             st.session_state.pop("batch_history_cache", None)
             st.session_state.pop("videos_zip", None)
