@@ -22,10 +22,11 @@ FLOW_BASE = "https://api.useapi.net/v1/google-flow"
 SOCIA_BASE = "https://api.sociavault.com/v1"
 SOCIA_PRODUCT_DETAILS = f"{SOCIA_BASE}/scrape/tiktok-shop/product-details"
 SOCIA_PRODUCT_REVIEWS = f"{SOCIA_BASE}/scrape/tiktok-shop/product-reviews"
-IMAGE_MODEL = "nano-banana-2"
+IMAGE_MODEL = "nano-banana-pro"
 VIDEO_MODEL = "omni-flash"  # Flow UI label: Omni 1.1 Flash
 VIDEO_DURATION = 8
-VIDEO_RESOLUTION = "720p"
+VIDEO_NATIVE_RESOLUTION = "720p"
+VIDEO_DOWNLOAD_RESOLUTION = "1080p"
 MAX_LINKS = 10
 MAX_PRODUCT_REFS = 5  # plus avatar = max 6 total refs, comfortably under NB2 max 10
 IMAGE_WORKERS = 3
@@ -36,10 +37,10 @@ BATCH_HISTORY_TAB = "Batch History"
 BATCH_DATA_TAB = "_Flow Batch Data"
 
 SCENES = {
-    "Modern apartment mirror": "a realistic modern upscale apartment with a large full-length mirror, warm ceiling lighting, neutral furniture, and believable lived-in details",
-    "Walk-in closet": "a realistic upscale walk-in closet with dark wood shelving, folded clothes, soft warm recessed lighting, and a large full-length mirror",
-    "Luxury bathroom mirror": "a realistic upscale bathroom with dark stone surfaces, a large clean mirror, warm ceiling light, and subtle hotel-like details",
-    "Penthouse at night": "a realistic modern penthouse at night with floor-to-ceiling windows, city lights, warm recessed lighting, polished floor, and a large full-length mirror",
+    "Modern apartment mirror": "a realistic upscale modern apartment with a large full-length mirror, warm evening ceiling light, neutral furniture, a casually placed bag or folded clothing, one or two plants, and believable lived-in details",
+    "Walk-in closet": "a realistic upscale walk-in closet with dark wood shelving, folded clothes, a few shoes and accessories naturally visible, soft warm recessed lighting, and a large full-length mirror",
+    "Luxury bathroom mirror": "a realistic upscale bathroom mirror scene with dark stone or marble surfaces, warm soft-spa lighting, a neatly placed towel and a few believable personal-care objects, polished but still lived-in",
+    "Penthouse at night": "a realistic modern penthouse at night with floor-to-ceiling windows, city lights, warm recessed lighting, a large mirror, subtle furniture and a few believable lived-in fashion/home details",
 }
 
 
@@ -168,11 +169,12 @@ def usage_cost_estimate(jobs: list[dict]) -> tuple[float, bool]:
 def _dashboard_stage(job: dict) -> str:
     image_status = str(job.get("image_status") or "pending").lower()
     video_status = str(job.get("video_status") or "pending").lower()
-    if image_status == "failed" or video_status == "failed":
+    hd_status = str(job.get("video_hd_status") or "pending").lower()
+    if image_status == "failed" or video_status == "failed" or hd_status == "failed":
         return "Failed"
-    if video_status == "completed":
+    if video_1080_ready(job):
         return "Ready"
-    if job.get("video_job_id") and video_status not in {"completed", "failed"}:
+    if video_pipeline_active(job):
         return "Processing"
     if image_status == "completed" and not job.get("approved"):
         return "Needs approval"
@@ -202,12 +204,14 @@ def _persistable_job(job: dict) -> dict:
         "url", "id", "name", "focus", "back_design", "selected_refs",
         "image_status", "image_job_id", "image_media_id", "image_url", "image_seed", "image_error", "approved",
         "video_status", "video_job_id", "video_submitted_at", "video_url", "video_media_id", "video_error", "thumbnail_url",
+        "video_source_url", "video_source_media_id", "video_upscale_job_id", "video_hd_status", "video_hd_error", "video_resolution", "video_upscale_attempts",
+        "creator_profile", "video_style",
         "drive_image_id", "drive_image_url", "drive_image_download_url", "drive_image_error",
         "drive_video_id", "drive_video_url", "drive_video_download_url", "drive_video_error",
         "drive_batch_folder_url", "drive_product_folder_url",
         "drive_reference_ids", "drive_reference_urls", "drive_reference_download_urls", "drive_reference_errors",
         "regen_instruction", "last_regen_instruction",
-        "image_attempts", "video_attempts", "image_failures", "video_failures", "sheet_row",
+        "image_attempts", "video_attempts", "image_failures", "video_failures", "video_upscale_attempts", "sheet_row",
         "_batch_id", "_batch_created_at",
     }
     return {k: v for k, v in job.items() if k in allowed}
@@ -520,13 +524,13 @@ def flow_generate_image(token: str, email: str, prompt: str, refs: list[str]) ->
     payload = request_json("POST", f"{FLOW_BASE}/images", headers=flow_headers(token, True), json_body=body, timeout=180, retries=1)
     media = payload.get("media") or []
     if not media:
-        raise RuntimeError("Nano Banana 2 returned no image media.")
+        raise RuntimeError("Nano Banana Pro returned no image media.")
     generated = (((media[0] or {}).get("image") or {}).get("generatedImage") or {})
     media_id = generated.get("mediaGenerationId")
     if not media_id:
         media_id = (media[0] or {}).get("mediaGenerationId")
     if not media_id:
-        raise RuntimeError("Nano Banana 2 returned no generated image mediaGenerationId.")
+        raise RuntimeError("Nano Banana Pro returned no generated image mediaGenerationId.")
     return {
         "job_id": payload.get("jobId") or payload.get("jobid"),
         "media_id": media_id,
@@ -542,7 +546,7 @@ def flow_submit_video(token: str, email: str, image_media_id: str, prompt: str) 
         "prompt": prompt,
         "aspectRatio": "portrait",
         "duration": VIDEO_DURATION,
-        "resolution": VIDEO_RESOLUTION,
+        "resolution": VIDEO_NATIVE_RESOLUTION,
         "count": 1,
         "startImage": image_media_id,
         "async": True,
@@ -554,6 +558,108 @@ def flow_submit_video(token: str, email: str, image_media_id: str, prompt: str) 
     if not job_id:
         raise RuntimeError("Omni 1.1 submitted without returning a job ID.")
     return {"job_id": job_id, "status": payload.get("status") or "created"}
+
+
+
+def flow_submit_video_upscale_1080(token: str, media_id: str) -> dict:
+    """Submit a free 1080p upscale for a completed Flow video.
+
+    Omni 1.1 Flash generates natively at up to 720p. useapi exposes the Flow
+    upscaler separately; 1080p is the final deliverable used by downloads,
+    ZIP exports and Drive archiving.
+    """
+    if not media_id:
+        raise RuntimeError("Cannot upscale: source video media ID is missing.")
+    body = {
+        "mediaGenerationId": media_id,
+        "resolution": VIDEO_DOWNLOAD_RESOLUTION,
+        "async": True,
+    }
+    payload = request_json(
+        "POST",
+        f"{FLOW_BASE}/videos/upscale",
+        headers=flow_headers(token, True),
+        json_body=body,
+        timeout=90,
+        retries=1,
+    )
+    job_id = payload.get("jobid") or payload.get("jobId")
+    if not job_id:
+        raise RuntimeError("1080p upscale submitted without returning a job ID.")
+    return {"job_id": job_id, "status": payload.get("status") or "created"}
+
+
+def flow_upscale_video_1080_sync(token: str, media_id: str) -> dict:
+    """Upscale a recovered/source video to 1080p and return the final asset.
+
+    Recovery is an explicit user action, so using the synchronous endpoint here
+    keeps the recovery UI simple while the main production pipeline remains
+    asynchronous/non-blocking.
+    """
+    if not media_id:
+        raise RuntimeError("Cannot upscale: source video media ID is missing.")
+    payload = request_json(
+        "POST",
+        f"{FLOW_BASE}/videos/upscale",
+        headers=flow_headers(token, True),
+        json_body={
+            "mediaGenerationId": media_id,
+            "resolution": VIDEO_DOWNLOAD_RESOLUTION,
+        },
+        timeout=150,
+        retries=1,
+    )
+    media = payload.get("media") or (payload.get("response") or {}).get("media") or []
+    if not media:
+        raise RuntimeError("1080p upscale finished without returning a media asset.")
+    item = media[0] or {}
+    final_id = str(item.get("mediaGenerationId") or "").strip()
+    final_url = str(item.get("videoUrl") or "").strip()
+    if not final_id:
+        raise RuntimeError("1080p upscale returned no final mediaGenerationId.")
+    return {
+        "video_media_id": final_id,
+        "video_url": final_url,
+        "thumbnail_url": item.get("thumbnailUrl"),
+        "video_resolution": VIDEO_DOWNLOAD_RESOLUTION,
+    }
+
+
+def video_1080_ready(job: dict) -> bool:
+    return (
+        str(job.get("video_status") or "").lower() == "completed"
+        and str(job.get("video_hd_status") or "").lower() == "completed"
+        and str(job.get("video_resolution") or "").lower() == "1080p"
+        and bool(job.get("video_media_id"))
+    )
+
+
+def video_pipeline_active(job: dict) -> bool:
+    source_status = str(job.get("video_status") or "pending").lower()
+    hd_status = str(job.get("video_hd_status") or "pending").lower()
+    if job.get("video_job_id") and source_status not in {"completed", "failed"}:
+        return True
+    if source_status == "completed" and not video_1080_ready(job) and hd_status not in {"failed"}:
+        return True
+    if job.get("video_upscale_job_id") and hd_status not in {"completed", "failed"}:
+        return True
+    return False
+
+
+def video_display_status(job: dict) -> str:
+    source_status = str(job.get("video_status") or "pending").lower()
+    hd_status = str(job.get("video_hd_status") or "pending").lower()
+    if source_status == "failed":
+        return "Failed"
+    if hd_status == "failed":
+        return "1080p upscale failed"
+    if video_1080_ready(job):
+        return "1080p ready"
+    if source_status == "completed":
+        return "Upscaling to 1080p"
+    if source_status in {"created", "started", "processing", "running"}:
+        return "Generating 720p"
+    return _status_label(source_status)
 
 
 def flow_get_job(token: str, job_id: str) -> dict:
@@ -585,9 +691,10 @@ def remember_video_job_ids(jobs: list[dict]) -> None:
     """Keep submitted job IDs in the browser URL so a Streamlit redeploy can recover them."""
     ids = []
     for job in jobs:
-        jid = str(job.get("video_job_id") or "").strip()
-        if jid and jid not in ids:
-            ids.append(jid)
+        for raw in (job.get("video_job_id"), job.get("video_upscale_job_id")):
+            jid = str(raw or "").strip()
+            if jid and jid not in ids:
+                ids.append(jid)
     if ids:
         try:
             st.query_params["flow_jobs"] = ",".join(ids[-10:])
@@ -860,13 +967,16 @@ def classify_focus(name: str) -> str:
     text = re.sub(r"[^a-z0-9]+", " ", (name or "").lower()).strip()
     tokens = set(text.split())
     shoes = {"shoe", "shoes", "sneaker", "sneakers", "boot", "boots", "heel", "heels", "sandal", "sandals", "loafer", "loafers", "clog", "clogs", "slipper", "slippers", "slides"}
-    tops = {"shirt", "tee", "hoodie", "sweater", "jacket", "coat", "blouse", "top", "tank", "cardigan", "jersey", "polo"}
+    bags = {"bag", "handbag", "purse", "tote", "satchel", "crossbody", "clutch"}
+    tops = {"shirt", "tee", "hoodie", "sweater", "jacket", "coat", "blouse", "top", "tank", "cardigan", "jersey", "polo", "vest"}
     bottoms = {"pants", "pant", "jeans", "jean", "shorts", "leggings", "legging", "jogger", "joggers", "trouser", "trousers", "skirt", "cargo"}
     outfit_phrases = ("two piece", "2 piece", "matching set", "tracksuit", "jumpsuit", "romper")
     outfit_tokens = {"set", "outfit", "suit", "dress"}
 
     if tokens & shoes:
         return "shoes"
+    if tokens & bags:
+        return "handbag"
     if any(p in text for p in outfit_phrases) or tokens & outfit_tokens:
         return "outfit"
     # Check tops before bottoms so words such as "short sleeve polo shirt" remain tops.
@@ -877,55 +987,196 @@ def classify_focus(name: str) -> str:
     return "outfit"
 
 
+
+def _creator_profile(job: dict) -> str:
+    value = str(job.get("creator_profile") or "Male").strip().lower()
+    return "female" if value.startswith("f") else "male"
+
+
+def _video_style(job: dict) -> str:
+    value = str(job.get("video_style") or "Calm / premium").strip().lower()
+    if "high" in value:
+        return "high"
+    if "flash" in value or "rapid" in value:
+        return "flashy"
+    return "calm"
+
+
+def _face_block_rule() -> str:
+    return (
+        "CRITICAL FACE RULE: this is a mirror selfie and the smartphone must stay directly in front of the model's face, "
+        "blocking the face completely. No eyes, eyebrows, nose, lips, cheeks, jawline, facial skin or recognizable facial features "
+        "may be visible around the phone. Hair may be visible, but the face itself must be 100% obscured by the phone. "
+        "Do not lower, offset, tilt away, or move the phone aside."
+    )
+
+
 def image_prompt(job: dict, scene: str, refs_count: int) -> str:
     focus = job.get("focus", "outfit")
     product = job.get("name", "clothing")
+    profile = _creator_profile(job)
     ref_mentions = " ".join(f"@reference_{i}" for i in range(2, refs_count + 1))
+
     if focus == "pants":
-        focus_rule = "The bottoms/pants are the hero. Make the waist, fit through the hips and thighs, leg shape, length, pockets and hem easy to judge. The free hand can naturally touch the waistband, pocket or thigh."
-        fallback = "Keep the top simple and neutral so it does not compete with the pants."
+        focus_rule = (
+            "The pants/bottoms are the hero. Preserve the exact color, fabric, wash, stitching, pockets, waistband, graphics, "
+            "leg shape, length and hem. Full-length framing to the toes so the entire garment can be judged."
+        )
+        fallback = "Style with a simple neutral fitted top that does not compete with the pants."
+        framing = "full-length mirror framing from the top of the phone/hair down to the toes"
     elif focus == "shirt":
-        focus_rule = "The shirt/top is the hero. Make the neckline, chest graphic or texture, sleeves, fit, hem and silhouette easy to judge. The free hand can naturally touch the chest, collar, sleeve or hem."
-        fallback = "If no matching bottoms are sold in the references, pair the top with simple fitted black pants and clean white sneakers."
+        focus_rule = (
+            "The shirt/top is the hero. Preserve the exact neckline, graphic, colors, sleeve shape, fabric texture, fit, hem and silhouette. "
+            "Make the product dominant and easy to judge."
+        )
+        fallback = "Pair it with a simple neutral complementary bottom, such as clean jeans or plain trousers, that does not compete with the top."
+        framing = "mirror framing from the top of the phone/hair through at least the knees, with the entire top unobstructed"
     elif focus == "shoes":
-        focus_rule = "The footwear is the hero. Keep the full body visible but pose with one foot slightly forward so the shoes are clear and correctly shaped."
+        focus_rule = (
+            "The shoes are the hero. Preserve the exact color, shape, material, sole, laces, branding details and proportions. "
+            "Full-length framing to the feet, with both shoes completely visible and one foot slightly forward."
+        )
         fallback = "Use simple neutral clothing that does not compete with the footwear."
+        framing = "full-length mirror framing from the top of the phone/hair to the toes"
+    elif focus == "handbag":
+        focus_rule = (
+            "The handbag is the hero. Preserve the exact texture, stitching, flap, handle or chain, clasp, charm, color, size and proportions. "
+            "The bag must read at its true size against the body and must not be duplicated, redesigned or recolored."
+        )
+        fallback = "Style the model in a simple polished neutral outfit that keeps attention on the bag."
+        framing = "full-length mirror framing from the top of the phone/hair to the feet, with the handbag fully visible"
     else:
-        focus_rule = "The full outfit is the hero. Show the top and bottom together clearly from head to toe with believable fit, drape and proportions."
+        focus_rule = (
+            "The complete outfit is the hero. Preserve every included garment exactly: color, graphic, pattern, fabric, construction, fit, "
+            "proportions and how the pieces coordinate."
+        )
         fallback = "Do not substitute, redesign, or add a different matching piece."
-    back = "The product references indicate a back design; use a slight angled pose that hints at it without hiding the front." if job.get("back_design") else ""
+        framing = "full-length mirror framing from the top of the phone/hair to the toes"
+
+    if profile == "female":
+        model_rule = (
+            "Use @reference_1 as the exact female avatar/person reference. Preserve her hair, skin tone, body build, tattoos, jewelry and other "
+            "visible identity cues outside the covered facial area. Keep a polished feminine fashion aesthetic, tasteful nails/accessories if already present."
+        )
+        pose_rule = "Relaxed confident feminine stance, free hand resting naturally at the waist/side or lightly touching the garment."
+    else:
+        model_rule = (
+            "Use @reference_1 as the exact male avatar/person reference. Preserve his hair, skin tone, body build, tattoos, jewelry and other "
+            "visible identity cues outside the covered facial area."
+        )
+        pose_rule = "Relaxed confident stance, free hand resting naturally at the side or lightly touching the garment."
+
+    back = (
+        "The product has an important back design. Use a slight three-quarter angle that hints at the back/side fit while still keeping the hero product readable."
+        if job.get("back_design") else ""
+    )
     revision = str(job.get("active_regen_instruction") or "").strip()
-    revision_rule = f"OPERATOR REVISION REQUEST: {revision}. Apply this request while preserving the exact product and avatar." if revision else ""
+    revision_rule = (
+        f"OPERATOR REVISION REQUEST: {revision}. Apply this request without changing the avatar, product identity, mirror setting, or face-covering rule."
+        if revision else ""
+    )
+
     return re.sub(r"\s+", " ", f"""
-Create one photorealistic vertical 9:16 iPhone mirror-selfie image for a TikTok clothing try-on.
-REFERENCE RULES: @reference_1 is the exact PERSON/AVATAR. Preserve this person's identity, face, skin, hair, body build and visible personal features. Do not copy the avatar's original clothes. {ref_mentions} are CLOTHING/PRODUCT references for {product}. Ignore any people/models appearing in those clothing references and use only the actual product design, colors, materials, print, construction and fit cues.
-Dress @reference_1 in the exact product shown by the clothing references. {focus_rule} {fallback} {back} {revision_rule}
-Scene: {SCENES[scene]}. The person holds a black smartphone at face level in one hand while taking a natural full-length mirror selfie. Full body head-to-toe must stay in frame. Casual confident UGC posture, slight weight shift, natural imperfect framing.
-Realism: authentic smartphone photo, natural skin texture, realistic hands and fingers, believable fabric folds and seams, subtle sensor grain, mild phone-camera compression, no studio lighting, no glossy commercial fashion look, no extra people, no duplicated limbs, no morphing, no text overlays, no prices, no added logos or watermarks. The image must look like an ordinary creator actually trying on the product.
+Ultrarealistic photorealistic iPhone 16 Pro mirror selfie, vertical 1080x1920, 9:16. {framing}.
+{model_rule}
+{_face_block_rule()}
+PRODUCT REFERENCES: {ref_mentions} are references for the exact product "{product}". Ignore any people/models in the product photos. Use only the real product itself. Preserve every visible product detail from the references -- exact colors, graphic/text placement, pattern, fabric, texture, cut, construction, proportions and fit. Over-describe and preserve rather than simplify.
+Dress the avatar in that exact product. {focus_rule} {fallback} {back}
+SETTING: {SCENES[scene]}. It must remain unmistakably a MIRROR setting. Make it warm, premium and lived-in rather than sterile: realistic household/fashion details, believable warm evening or soft spa lighting, natural shadows, subtle depth and ordinary imperfections.
+POSE: {pose_rule} Phone hand has only subtle natural sway; the phone itself remains centered over the face and blocks it completely.
+REALISM: authentic creator-made smartphone photo, natural skin texture, realistic hands and fingers, believable garment folds/seams, mild phone-camera compression and subtle sensor grain. No studio lighting, no glossy catalog look, no extra people, no duplicate limbs, no morphing, no prices, captions, added logos or watermarks, no sexual pose.
+{revision_rule}
+CRITICAL: preserve every detail of the product from the reference photo. NO FACE SHOWN. PHONE BLOCKS THE FACE COMPLETELY.
 """).strip()
 
 
 def video_prompt(job: dict) -> str:
     focus = job.get("focus", "outfit")
+    profile = _creator_profile(job)
+    style = _video_style(job)
     back = bool(job.get("back_design"))
-    if focus == "pants":
-        motion = "Start full-body front view. Shift weight naturally, then use the free hand to touch or gesture to the waistband, pocket and upper thigh. Take a small half-step and quarter-turn to show the side fit and leg shape. Finish angled with one leg slightly forward, keeping the pants visible from waist to hem."
-    elif focus == "shirt":
-        motion = "Start full-body front view. Use the free hand to brush the chest, collar, sleeve or hem while gently shifting weight. Make a natural quarter-turn to show the side silhouette."
-        if back:
-            motion += " Briefly rotate farther to clearly reveal the back graphic/design, then return toward the mirror."
-        motion += " Finish with a relaxed front/three-quarter pose, shirt still clearly visible."
-    elif focus == "shoes":
-        motion = "Start full-body with one foot slightly forward. Shift weight between feet, make one small natural step, then angle the legs to show the footwear from front and side. Finish with one foot forward and the shoes unobstructed."
+
+    if focus == "shoes":
+        movement = (
+            "Beat 1: stand grounded facing the mirror with both shoes clearly visible. "
+            "Beat 2: lift one heel while the toe stays down and gently angle that foot to show the side profile. "
+            "Beat 3: settle, take one small controlled step forward, then finish with both shoes clearly framed and a small confident nod."
+        )
+        product_lock = "Keep the shoes identical in every frame -- exact color, shape, material, sole and details. Do not redesign or recolor them."
+    elif focus == "handbag":
+        movement = (
+            "Beat 1: hold the bag low at the side and give it a tiny confident lift. "
+            "Beat 2: take a slow step toward the mirror with the bag beside the thigh. "
+            "Beat 3: raise the bag to waist height and angle the front toward the mirror so hardware, stitching and shape stay sharp. "
+            "Finish with the bag against the hip to show its true size, then a confident nod."
+        )
+        product_lock = (
+            "Keep the handbag identical in every frame -- exact texture, stitching, flap, chain/handle, clasp, charm, color, size and proportions. "
+            "Never shrink, swell, bend, duplicate, redesign or recolor it."
+        )
+    elif profile == "female":
+        if style == "high":
+            movement = (
+                "Beat 1: a quick confident greeting wave with the free hand, then the free hand settles on the waist with a small natural bounce. "
+                "Beat 2: take a confident power step toward the mirror while the free hand travels from collarbone to hip along the center line of the outfit. "
+                "Beat 3: quickly adjust a necklace/neckline or lightly pull the hem to show fit, then make a controlled side turn and finish with a confident nod."
+            )
+        elif style == "flashy":
+            movement = (
+                "Keep a constant steady phone-light/LED-style glow with no flicker, pulse or strobe. "
+                "Beat 1: soft confident greeting wave, then hand to waist. "
+                "Beat 2: slow confident step toward the mirror while the free hand follows the outfit from collarbone to hip. "
+                "Beat 3: lightly touch the fabric to catch the light, make a slow side turn, and finish with a confident nod. "
+                "Keep graphics and text on the garment sharp and well-lit, never blown out."
+            )
+        else:
+            movement = (
+                "Beat 1: a soft, calm greeting wave with the free hand, then rest that hand on the waist. "
+                "Beat 2: take a slow confident step toward the mirror while the free hand travels from collarbone down to hip, following the center line of the outfit. "
+                "Beat 3: gently touch the fabric or make a subtle hair adjustment, then perform a slow side turn, hold briefly, and finish with a confident nod."
+            )
+        product_lock = "Keep the exact same outfit, jewelry, shoes, background and lighting throughout."
     else:
-        motion = "Start in a centered full-body front pose. Use the free hand to gesture naturally across the top and lower outfit, then shift weight and make a smooth quarter-turn to show the silhouette from the side."
-        if back:
-            motion += " Briefly turn enough to reveal the back design."
-        motion += " Finish in a confident three-quarter full-body pose showing the complete outfit."
+        if style == "high":
+            movement = (
+                "Beat 1: a quick confident greeting motion with the free hand, immediately followed by stretching the free arm out to show the fit. "
+                "Beat 2: take a bouncy but controlled power step toward the mirror while the free hand runs from neck/chest down toward the waist to show the design. "
+                "Beat 3: point to the graphic or chest detail, pinch-release the fabric once, make a controlled side turn, then finish with a quick salute or confident nod."
+            )
+        elif style == "flashy":
+            movement = (
+                "Fast trend-style energy without cuts: a quick shoulder/free-hand opener, then a short power step toward the mirror with a gentle speed-ramp feel. "
+                "Use the free hand to pull the hem once, pinch-release the fabric, point to the key graphic, make a quick controlled side turn, and finish with a confident double nod. "
+                "Keep motion snappy but anatomically realistic."
+            )
+        else:
+            movement = (
+                "Beat 1: subtle bicep/free-arm flex, then extend the free arm slightly to show the fit. "
+                "Beat 2: take a slow powerful step toward the mirror while the free hand moves from neck/chest down toward the waist, showing the design. "
+                "Beat 3: rub/pinch the fabric briefly between thumb and forefinger to show texture, then make a slow side turn, hold briefly, and finish with a small confident double nod."
+            )
+        product_lock = "Keep the exact same outfit, shoes, accessories, background and lighting throughout."
+
+    if focus in {"pants", "outfit"} and back:
+        movement += (
+            " Include a tasteful back/side fit reveal: start or settle slightly angled, make only a slow partial turn (not a full spin), "
+            "let the free hand lightly adjust the waist/hip fabric, and finish with the back/side line still readable."
+        )
+    elif focus == "pants":
+        movement += (
+            " Make the waist, hip, thigh, leg shape and hem readable; include a slow partial side turn and a light waistband/pocket/hip touch with the free hand."
+        )
+    elif focus == "shirt" and back:
+        movement += " Briefly rotate far enough to reveal the important back graphic/design, then return to a three-quarter mirror pose."
+
     return re.sub(r"\s+", " ", f"""
-8-second vertical 9:16 TikTok UGC mirror try-on, one continuous shot, no cuts. Use the supplied start image as the exact first frame and preserve the exact same person, face, body, clothing, shoes, room, mirror, phone, lighting and product details for the entire clip.
-Movement should look like a real person casually checking the fit in a mirror, not a fashion runway and not exaggerated choreography. {motion}
-Keep the phone naturally at face level most of the time. Maintain realistic anatomy, garment physics and mirror geometry. The clothing must never change color, print, material, proportions or pieces. No zoom jump, no camera cut, no transformation, no extra people, no duplicate body parts, no text, subtitles, captions, music, speech or sound effects. Natural subtle iPhone handheld motion only.
+8-second vertical 1080x1920, 9:16 ultrarealistic mirror-selfie fashion showcase. One continuous take, multi-shot OFF, no cuts. Use the approved start image as the exact first frame.
+CRITICAL: the hand holding the phone remains holding the phone throughout the entire video and the phone blocks the face completely in every frame. No face shown at any point. Never lower the phone, move it aside, tilt it away, or reveal eyes, nose, mouth, cheeks, jawline or facial skin during walking, turning, nodding or posing. Phone hand steady.
+Preserve the exact same avatar/person, hair, body build, clothing, shoes, accessories, room, mirror, phone, lighting and product details for the full clip. {product_lock}
+{movement}
+Movement should feel like a real creator casually showing the fit in a mirror: confident, clean and premium, but still homemade and believable. Natural subtle iPhone handheld sway only. Keep mirror geometry, anatomy and garment physics realistic.
+No bending, no squatting, no sexual poses, no extra people, no duplicate body parts, no morphing, no product redesign, no color/graphic changes, no subtitles, captions or text overlays. Audio OFF: no speech, music or sound effects.
+FINAL CRITICAL RULE: PHONE REMAINS IN FRONT OF THE FACE AND BLOCKS IT COMPLETELY THROUGH THE FINAL FRAME. NO FACE SHOWN AT ANY POINT.
 """).strip()
 
 
@@ -992,6 +1243,8 @@ def ensure_job_refs(job: dict, token: str, email: str, avatar_id: str) -> tuple[
 
 def generate_one_image(job: dict, token: str, email: str, avatar_id: str, scene: str) -> dict:
     updated = dict(job)
+    updated["creator_profile"] = str(updated.get("creator_profile") or "Male")
+    updated["video_style"] = str(updated.get("video_style") or "Calm / premium")
     updated["image_attempts"] = int(updated.get("image_attempts") or 0) + 1
     try:
         refs, updated = ensure_job_refs(updated, token, email, avatar_id)
@@ -1011,6 +1264,13 @@ def generate_one_image(job: dict, token: str, email: str, avatar_id: str, scene:
             "video_url": None,
             "video_media_id": None,
             "video_error": None,
+            "video_source_url": None,
+            "video_source_media_id": None,
+            "video_upscale_job_id": None,
+            "video_hd_status": "pending",
+            "video_hd_error": None,
+            "video_resolution": None,
+            "video_upscale_attempts": 0,
             "drive_image_id": None,
             "drive_image_url": None,
             "drive_image_download_url": None,
@@ -1029,8 +1289,11 @@ def generate_one_image(job: dict, token: str, email: str, avatar_id: str, scene:
     return updated
 
 
+
 def submit_one_video(job: dict, token: str, email: str) -> dict:
     updated = dict(job)
+    updated["creator_profile"] = str(updated.get("creator_profile") or "Male")
+    updated["video_style"] = str(updated.get("video_style") or "Calm / premium")
     if not updated.get("image_media_id"):
         updated["video_status"] = "failed"
         updated["video_error"] = "No completed image media ID."
@@ -1045,6 +1308,13 @@ def submit_one_video(job: dict, token: str, email: str) -> dict:
             "video_url": None,
             "video_media_id": None,
             "video_error": None,
+            "video_source_url": None,
+            "video_source_media_id": None,
+            "video_upscale_job_id": None,
+            "video_hd_status": "pending",
+            "video_hd_error": None,
+            "video_resolution": None,
+            "video_upscale_attempts": 0,
             "drive_video_id": None,
             "drive_video_url": None,
             "drive_video_download_url": None,
@@ -1058,21 +1328,94 @@ def submit_one_video(job: dict, token: str, email: str) -> dict:
 
 
 def refresh_one_video(job: dict, token: str) -> dict:
+    """Advance both stages: native Omni generation, then automatic 1080p upscale."""
     updated = dict(job)
-    if not updated.get("video_job_id"):
+    source_status = str(updated.get("video_status") or "pending").lower()
+
+    # Stage 1: poll the native 720p Omni generation.
+    if updated.get("video_job_id") and source_status not in {"completed", "failed"}:
+        try:
+            result = parse_video_job(flow_get_job(token, updated["video_job_id"]), token)
+            updated["video_status"] = result.get("status") or updated.get("video_status")
+            if result.get("video_url"):
+                updated["video_source_url"] = result["video_url"]
+                # Until the upscale completes, keep this as a preview fallback.
+                updated["video_url"] = result["video_url"]
+            if result.get("video_media_id"):
+                updated["video_source_media_id"] = result["video_media_id"]
+                updated["video_media_id"] = result["video_media_id"]
+                updated["video_resolution"] = VIDEO_NATIVE_RESOLUTION
+            if result.get("thumbnail_url"):
+                updated["thumbnail_url"] = result["thumbnail_url"]
+            updated["video_error"] = result.get("error")
+        except Exception as exc:
+            updated["video_error"] = str(exc)
+
+    source_status = str(updated.get("video_status") or "pending").lower()
+    if source_status != "completed":
         return updated
-    try:
-        result = parse_video_job(flow_get_job(token, updated["video_job_id"]), token)
-        updated["video_status"] = result.get("status") or updated.get("video_status")
-        if result.get("video_url"):
-            updated["video_url"] = result["video_url"]
-        if result.get("video_media_id"):
-            updated["video_media_id"] = result["video_media_id"]
-        if result.get("thumbnail_url"):
-            updated["thumbnail_url"] = result["thumbnail_url"]
-        updated["video_error"] = result.get("error")
-    except Exception as exc:
-        updated["video_error"] = str(exc)
+
+    # Backward compatibility: batches created before R13 only have video_media_id.
+    source_media_id = str(updated.get("video_source_media_id") or updated.get("video_media_id") or "").strip()
+    if source_media_id and not updated.get("video_source_media_id"):
+        updated["video_source_media_id"] = source_media_id
+    if updated.get("video_url") and not updated.get("video_source_url") and str(updated.get("video_resolution") or "").lower() != "1080p":
+        updated["video_source_url"] = updated.get("video_url")
+
+    # A completed source without a media ID cannot be promoted. Surface a real
+    # failure instead of leaving the dashboard in an endless "Upscaling" state.
+    if not source_media_id:
+        updated["video_hd_status"] = "failed"
+        updated["video_hd_error"] = "The 720p source completed but Flow returned no media ID, so the 1080p upscale could not start. Refresh/recover the source job and try again."
+        return updated
+
+    # Guard against corrupted/restored state that says the upscale completed
+    # without retaining the final 1080p asset ID.
+    if str(updated.get("video_hd_status") or "").lower() == "completed" and not video_1080_ready(updated):
+        updated["video_hd_status"] = "failed"
+        updated["video_hd_error"] = "The 1080p upscale is marked completed but the final media ID is missing. Retry the upscale."
+        return updated
+
+    # Already have the final deliverable.
+    if video_1080_ready(updated):
+        return updated
+
+    # Stage 2: submit the 1080p upscale exactly once.
+    hd_status = str(updated.get("video_hd_status") or "pending").lower()
+    if source_media_id and not updated.get("video_upscale_job_id") and hd_status not in {"completed", "failed"}:
+        try:
+            upscale = flow_submit_video_upscale_1080(token, source_media_id)
+            updated["video_upscale_job_id"] = upscale["job_id"]
+            updated["video_hd_status"] = upscale.get("status") or "created"
+            updated["video_hd_error"] = None
+            updated["video_upscale_attempts"] = int(updated.get("video_upscale_attempts") or 0) + 1
+        except Exception as exc:
+            updated["video_hd_status"] = "failed"
+            updated["video_hd_error"] = str(exc)
+            return updated
+
+    # Poll the async upscale job.
+    hd_status = str(updated.get("video_hd_status") or "pending").lower()
+    if updated.get("video_upscale_job_id") and hd_status not in {"completed", "failed"}:
+        try:
+            result = parse_video_job(flow_get_job(token, updated["video_upscale_job_id"]), token)
+            updated["video_hd_status"] = result.get("status") or updated.get("video_hd_status")
+            if result.get("video_url"):
+                updated["video_url"] = result["video_url"]
+            if result.get("video_media_id"):
+                updated["video_media_id"] = result["video_media_id"]
+            if result.get("thumbnail_url"):
+                updated["thumbnail_url"] = result["thumbnail_url"]
+            updated["video_hd_error"] = result.get("error")
+            if str(updated.get("video_hd_status") or "").lower() == "completed":
+                if updated.get("video_media_id"):
+                    updated["video_resolution"] = VIDEO_DOWNLOAD_RESOLUTION
+                else:
+                    updated["video_hd_status"] = "failed"
+                    updated["video_hd_error"] = "1080p upscale completed but Flow returned no final media ID. Retry the upscale."
+        except Exception as exc:
+            updated["video_hd_error"] = str(exc)
+
     return updated
 
 
@@ -1177,9 +1520,9 @@ def jobs_export_rows(jobs: list[dict]) -> tuple[list[str], list[list[str]]]:
             str(job.get("image_media_id") or ""),
             str(job.get("drive_image_url") or ""),
             str(job.get("drive_image_id") or ""),
-            _status_label(job.get("video_status")),
-            str(job.get("video_url") or ""),
-            str(job.get("video_media_id") or ""),
+            video_display_status(job),
+            str(job.get("video_url") or "") if video_1080_ready(job) else "",
+            str(job.get("video_media_id") or "") if video_1080_ready(job) else "",
             str(job.get("video_job_id") or ""),
             str(job.get("drive_video_url") or ""),
             str(job.get("drive_video_id") or ""),
@@ -1229,8 +1572,14 @@ def build_images_zip(jobs: list[dict]) -> bytes | None:
     return out.getvalue() if added else None
 
 
-def download_video_for_job(token: str, job: dict) -> bytes | None:
-    """Fetch a completed MP4 without relying on an expiring signed URL."""
+def download_video_for_job(token: str, job: dict, require_1080: bool = True) -> bytes | None:
+    """Fetch the final MP4 without relying on an expiring signed URL.
+
+    R13 treats the 1080p upscale as the deliverable. The native 720p Omni
+    render is preview-only unless require_1080=False is explicitly requested.
+    """
+    if require_1080 and not video_1080_ready(job):
+        return None
     media_id = str(job.get("video_media_id") or "").strip()
     if media_id:
         data, _ = download_video_raw(token, media_id)
@@ -1254,11 +1603,11 @@ def build_videos_zip(jobs: list[dict], token: str) -> bytes | None:
     added = 0
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
         for i, job in enumerate(jobs, 1):
-            if job.get("video_status") != "completed":
+            if not video_1080_ready(job):
                 continue
             data = download_video_for_job(token, job)
             if data:
-                z.writestr(f"{i:02d}_{safe_name(job.get('name'))}.mp4", data)
+                z.writestr(f"{i:02d}_{safe_name(job.get('name'))}_1080p.mp4", data)
                 added += 1
     return out.getvalue() if added else None
 
@@ -1288,10 +1637,10 @@ def build_full_batch_zip(jobs: list[dict], token: str) -> tuple[bytes | None, di
                 if data:
                     z.writestr(f"images/{stem}.jpg", data)
                     image_count += 1
-            if job.get("video_status") == "completed":
-                data = download_video_for_job(token, job)
+            if video_1080_ready(job):
+                data = download_video_for_job(token, job, require_1080=True)
                 if data:
-                    z.writestr(f"videos/{stem}.mp4", data)
+                    z.writestr(f"videos/{stem}_1080p.mp4", data)
                     video_count += 1
     payload = out.getvalue()
     return (payload if (jobs or image_count or video_count) else None), {"images": image_count, "videos": video_count}
@@ -1320,33 +1669,19 @@ def image_bytes_for_job(job: dict) -> tuple[bytes | None, str]:
     return None, "image/jpeg"
 
 
-
 def drive_batch_name(jobs: list[dict]) -> str:
-    # Prefer the durable batch ID so separate runs never merge in Drive.
-    batch_id = next(
-        (
-            str(j.get("_batch_id") or "").strip()
-            for j in jobs
-            if str(j.get("_batch_id") or "").strip()
-        ),
-        "",
-    )
-    if batch_id:
-        return f"Batch {batch_id}"
-
-    # Backward-compatible fallback for older saved state.
-    fingerprint = "|".join(
-        str(j.get("url") or j.get("id") or j.get("name") or "")
-        for j in jobs
-    )
+    """Deterministic folder name so a retry/redeploy does not create a new batch."""
+    fingerprint = "|".join(str(j.get("url") or j.get("id") or j.get("name") or "") for j in jobs)
     digest = hashlib.sha1(fingerprint.encode("utf-8")).hexdigest()[:8] if fingerprint else "batch"
     return f"Flow Try-On {digest}"
+
 
 def _archive_filename(index: int, job: dict, kind: str) -> str:
     media_id = str(job.get("image_media_id") if kind == "image" else job.get("video_media_id") or job.get("video_job_id") or "")
     media_tag = safe_name(media_id, "media")[-18:]
     ext = "jpg" if kind == "image" else "mp4"
-    return f"{index:02d}_{safe_name(job.get('name'))}_{media_tag}.{ext}"
+    resolution_tag = "_1080p" if kind == "video" and video_1080_ready(job) else ""
+    return f"{index:02d}_{safe_name(job.get('name'))}_{media_tag}{resolution_tag}.{ext}"
 
 
 def archive_bytes_to_google_drive(data: bytes, mime_type: str, filename: str, kind: str, batch_name: str, description: str = "", product_name: str = "", batch_date: str = "") -> tuple[dict | None, str]:
@@ -1419,7 +1754,7 @@ def archive_completed_jobs(jobs: list[dict], token: str, progress_callback=None)
                 tasks.append((idx, "reference", ref_idx, ref_url))
         if job.get("image_status") == "completed" and not job.get("drive_image_id"):
             tasks.append((idx, "image", None, None))
-        if job.get("video_status") == "completed" and not job.get("drive_video_id"):
+        if video_1080_ready(job) and not job.get("drive_video_id"):
             tasks.append((idx, "video", None, None))
 
     report = {"uploaded": 0, "existing": 0, "failed": 0, "attempted": len(tasks), "references": 0, "images": 0, "videos": 0, "errors": []}
@@ -1667,235 +2002,65 @@ def _format_google_sheet(book, ws, headers: list[str], data_rows: int) -> None:
     book.batch_update({"requests": requests_payload})
 
 
-
-def _sheet_col_letter(col_num: int) -> str:
-    col_num = max(1, int(col_num))
-    letters = ""
-    while col_num:
-        col_num, rem = divmod(col_num - 1, 26)
-        letters = chr(65 + rem) + letters
-    return letters
-
-
-def _sheet_int(value, default: int = 0) -> int:
-    try:
-        return int(str(value or "").strip())
-    except Exception:
-        return default
-
-
-def _tracker_max_product_number(existing: list[list[str]]) -> int:
-    best = 0
-    for row in existing[1:]:
-        if row:
-            best = max(best, _sheet_int(row[0], 0))
-    return best
-
-
-def _single_job_sheet_row(
-    job: dict,
-    product_number: int,
-    sheet_row: int,
-) -> tuple[list[str], list[str]]:
-    headers, rows = _jobs_sheet_rows([job])
-    row = list(rows[0]) if rows else [""] * len(headers)
-
-    if len(row) < len(headers):
-        row += [""] * (len(headers) - len(row))
-
-    row[0] = str(product_number)
-    row[25] = str(sheet_row)
-    job["sheet_row"] = sheet_row
-    return headers, row
-
-
-def push_jobs_to_google_sheet(
-    jobs: list[dict],
-    spreadsheet_url: str,
-    worksheet_name: str,
-    mode: str = "Append/update tracker",
-) -> tuple[bool, str]:
-    # Non-destructive production tracker:
-    # - jobs with a Sheet row update that row
-    # - new jobs append underneath
-    # - old rows are never cleared unless Replace tab is explicitly selected
-
+def push_jobs_to_google_sheet(jobs: list[dict], spreadsheet_url: str, worksheet_name: str, mode: str = "Replace tab") -> tuple[bool, str]:
+    """Push the current batch to Google Sheets using a service account."""
     info = get_google_service_account_info()
     if not info:
-        return False, (
-            "Google Sheets is not configured. Add GOOGLE_SERVICE_ACCOUNT_JSON "
-            "(or [gcp_service_account]) to Streamlit Secrets."
-        )
-
+        return False, "Google Sheets is not configured. Add GOOGLE_SERVICE_ACCOUNT_JSON (or [gcp_service_account]) to Streamlit Secrets."
     try:
         import gspread
     except Exception:
-        return False, (
-            "Google Sheets dependency is missing. Make sure gspread is in "
-            "requirements.txt and redeploy."
-        )
+        return False, "Google Sheets dependency is missing. Make sure gspread is in requirements.txt and redeploy."
 
     sheet_ref = str(spreadsheet_url or "").strip()
     if not sheet_ref:
         return False, "Paste a Google Sheet URL first."
-
     tab_name = (str(worksheet_name or "Flow Try-On").strip() or "Flow Try-On")[:100]
-    base_headers, _ = _jobs_sheet_rows([])
-
+    headers, rows = _jobs_sheet_rows(jobs)
+    values = [headers] + rows
     try:
         gc = gspread.service_account_from_dict(info)
-        if sheet_ref.startswith(("http://", "https://")):
+        if sheet_ref.startswith("http://") or sheet_ref.startswith("https://"):
             book = gc.open_by_url(sheet_ref)
         else:
             book = gc.open_by_key(sheet_ref)
-
         try:
             ws = book.worksheet(tab_name)
         except gspread.WorksheetNotFound:
-            ws = book.add_worksheet(
-                title=tab_name,
-                rows=max(100, len(jobs) + 30),
-                cols=max(30, len(base_headers) + 2),
-            )
-
-        existing = ws.get_all_values()
-
-        # Keep the headers current without touching data rows.
-        ws.update(
-            range_name="A1",
-            values=[base_headers],
-            value_input_option="USER_ENTERED",
-        )
-        if not existing:
-            existing = [base_headers]
-
-        last_col = _sheet_col_letter(len(base_headers))
-        max_product_number = _tracker_max_product_number(existing)
+            ws = book.add_worksheet(title=tab_name, rows=max(100, len(values) + 20), cols=max(20, len(headers) + 2))
 
         if mode == "Append rows":
+            existing = ws.get_all_values()
+            if not existing:
+                ws.update(range_name="A1", values=[headers])
             start_row = max(len(existing), 1) + 1
-            next_product_number = max_product_number + 1
-            appended_rows = []
-
             for i, job in enumerate(jobs):
-                headers, row = _single_job_sheet_row(
-                    job,
-                    next_product_number + i,
-                    start_row + i,
-                )
-                appended_rows.append(row)
-
-            if appended_rows:
-                ws.append_rows(
-                    appended_rows,
-                    value_input_option="USER_ENTERED",
-                    insert_data_option="INSERT_ROWS",
-                )
-
-            final_row_count = max(len(existing), 1) + len(appended_rows)
-            rows_saved = len(appended_rows)
-
-        elif mode == "Append/update tracker":
-            next_row = max(len(existing), 1) + 1
-            next_product_number = max_product_number + 1
-            rows_saved = 0
-            highest_row = max(len(existing), 1)
-
-            for job in jobs:
-                requested_row = _sheet_int(job.get("sheet_row"), 0)
-                can_update_existing = 2 <= requested_row <= max(len(existing), 1)
-
-                if can_update_existing:
-                    target_row = requested_row
-                    old = (
-                        existing[target_row - 1]
-                        if target_row - 1 < len(existing)
-                        else []
-                    )
-                    product_number = _sheet_int(
-                        old[0] if old else "",
-                        target_row - 1,
-                    )
-                else:
-                    target_row = next_row
-                    next_row += 1
-                    product_number = next_product_number
-                    next_product_number += 1
-
-                headers, row = _single_job_sheet_row(
-                    job,
-                    product_number,
-                    target_row,
-                )
-
-                if target_row > ws.row_count:
-                    ws.add_rows(max(20, target_row - ws.row_count + 10))
-
-                ws.update(
-                    range_name=f"A{target_row}:{last_col}{target_row}",
-                    values=[row],
-                    value_input_option="USER_ENTERED",
-                )
-
-                while len(existing) < target_row:
-                    existing.append([])
-                existing[target_row - 1] = row
-
-                highest_row = max(highest_row, target_row)
-                rows_saved += 1
-
-            final_row_count = highest_row
-
+                job["sheet_row"] = start_row + i
+            headers, rows = _jobs_sheet_rows(jobs)
+            if rows:
+                ws.append_rows(rows, value_input_option="USER_ENTERED", insert_data_option="INSERT_ROWS")
+            final_row_count = max(len(existing), 1) + len(rows)
         else:
-            # Explicit destructive option retained for deliberate use.
             for i, job in enumerate(jobs):
                 job["sheet_row"] = i + 2
-
             headers, rows = _jobs_sheet_rows(jobs)
             values = [headers] + rows
             ws.clear()
-            ws.update(
-                range_name="A1",
-                values=values,
-                value_input_option="USER_ENTERED",
-            )
+            ws.update(range_name="A1", values=values, value_input_option="USER_ENTERED")
             final_row_count = len(rows) + 1
-            rows_saved = len(rows)
 
+        # Formatting is best-effort: a data push should still succeed even if Google rejects a visual setting.
         format_warning = ""
         try:
-            _format_google_sheet(
-                book,
-                ws,
-                base_headers,
-                max(0, final_row_count - 1),
-            )
+            _format_google_sheet(book, ws, headers, max(0, final_row_count - 1))
         except Exception as fmt_exc:
-            format_warning = (
-                f" Data was saved, but Sheet formatting could not be applied: {fmt_exc}"
-            )
+            format_warning = f" Data was saved, but Sheet formatting could not be applied: {fmt_exc}"
 
         service_email = str(info.get("client_email") or "service account")
-
-        if mode == "Append/update tracker":
-            action_text = (
-                f"Synced {rows_saved} product(s) to '{tab_name}'. "
-                "Older rows were preserved; existing current-batch rows were updated "
-                "and new products were added underneath."
-            )
-        elif mode == "Append rows":
-            action_text = (
-                f"Appended {rows_saved} product(s) beneath the existing rows in '{tab_name}'."
-            )
-        else:
-            action_text = f"Replaced '{tab_name}' with {rows_saved} product(s)."
-
-        return True, (
-            f"{action_text} Connected as {service_email}.{format_warning}"
-        )
-
+        return True, f"Pushed {len(rows)} product(s) to '{tab_name}' and formatted it for easier reading. Connected as {service_email}.{format_warning}"
     except Exception as exc:
         return False, f"Google Sheets push failed: {exc}"
+
 
 def _open_google_book(spreadsheet_url: str):
     info = get_google_service_account_info()
@@ -1917,7 +2082,7 @@ def persist_batch_history_to_google_sheet(jobs: list[dict], spreadsheet_url: str
     estimated_cost, has_cost_rates = usage_cost_estimate(jobs)
     images_ready = sum(1 for j in jobs if j.get("image_status") == "completed")
     approved = sum(1 for j in jobs if j.get("approved"))
-    videos_ready = sum(1 for j in jobs if j.get("video_status") == "completed")
+    videos_ready = sum(1 for j in jobs if video_1080_ready(j))
     processing = sum(1 for j in jobs if _dashboard_stage(j) == "Processing")
     failed = sum(1 for j in jobs if _dashboard_stage(j) == "Failed")
     folder_url = next((str(j.get("drive_batch_folder_url") or "") for j in jobs if j.get("drive_batch_folder_url")), "")
@@ -2053,7 +2218,7 @@ def maybe_sync_batch(jobs: list[dict], spreadsheet_url: str, *, sync_current_tab
     messages = []
     ok_current = True
     if sync_current_tab:
-        ok_current, msg = push_jobs_to_google_sheet(jobs, spreadsheet_url, "Flow Try-On", "Append/update tracker")
+        ok_current, msg = push_jobs_to_google_sheet(jobs, spreadsheet_url, "Flow Try-On", "Replace tab")
         if msg: messages.append(msg)
     ok_history, hist_msg = persist_batch_history_to_google_sheet(jobs, spreadsheet_url)
     if hist_msg: messages.append(hist_msg)
@@ -2141,7 +2306,7 @@ def avatar_library():
 
 def reset_generated(job: dict) -> dict:
     job = dict(job)
-    for key in ["flow_product_ref_ids", "ref_signature", "image_status", "image_job_id", "image_media_id", "image_url", "image_encoded", "image_seed", "image_error", "approved", "video_status", "video_job_id", "video_submitted_at", "video_url", "video_media_id", "video_error", "thumbnail_url", "drive_image_id", "drive_image_url", "drive_image_download_url", "drive_image_error", "drive_video_id", "drive_video_url", "drive_video_download_url", "drive_video_error", "drive_batch_folder_url", "drive_product_folder_url", "drive_reference_ids", "drive_reference_urls", "drive_reference_download_urls", "drive_reference_errors"]:
+    for key in ["flow_product_ref_ids", "ref_signature", "image_status", "image_job_id", "image_media_id", "image_url", "image_encoded", "image_seed", "image_error", "approved", "video_status", "video_job_id", "video_submitted_at", "video_url", "video_media_id", "video_error", "thumbnail_url", "video_source_url", "video_source_media_id", "video_upscale_job_id", "video_hd_status", "video_hd_error", "video_resolution", "video_upscale_attempts", "drive_image_id", "drive_image_url", "drive_image_download_url", "drive_image_error", "drive_video_id", "drive_video_url", "drive_video_download_url", "drive_video_error", "drive_batch_folder_url", "drive_product_folder_url", "drive_reference_ids", "drive_reference_urls", "drive_reference_download_urls", "drive_reference_errors"]:
         job.pop(key, None)
     job.update({"image_status": "pending", "approved": False, "video_status": "pending"})
     return job
@@ -2240,7 +2405,7 @@ def render_job_editor(job: dict, index: int, social_token: str = "", region: str
         with c1:
             updated["name"] = st.text_input("Product name", value=job.get("name", ""), key=f"name_{job['id']}")
         with c2:
-            focus_options = ["shirt", "pants", "outfit", "shoes"]
+            focus_options = ["shirt", "pants", "outfit", "shoes", "handbag"]
             current_focus = job.get("focus", "outfit") if job.get("focus") in focus_options else "outfit"
             updated["focus"] = st.selectbox(
                 "Try-on emphasis",
@@ -2276,7 +2441,7 @@ def render_job_result(job: dict, index: int, token: str, email: str, avatar_id: 
         img_col, vid_col = st.columns(2, gap="large")
         with img_col:
             st.markdown("<div class='panel-title'>Try-on image</div>", unsafe_allow_html=True)
-            st.markdown("<div class='panel-sub'>Nano Banana 2 · portrait 9:16</div>", unsafe_allow_html=True)
+            st.markdown("<div class='panel-sub'>Nano Banana Pro · portrait 9:16</div>", unsafe_allow_html=True)
             image_bytes = image_bytes_for_job(job)[0] if job.get("image_status") == "completed" else None
             if image_bytes:
                 st.image(image_bytes, use_container_width=True)
@@ -2309,74 +2474,100 @@ def render_job_result(job: dict, index: int, token: str, email: str, avatar_id: 
 
         with vid_col:
             st.markdown("<div class='panel-title'>Motion result</div>", unsafe_allow_html=True)
-            st.markdown("<div class='panel-sub'>Omni 1.1 Flash · 8 sec · 720p</div>", unsafe_allow_html=True)
+            st.markdown("<div class='panel-sub'>Omni 1.1 Flash · 8 sec · native 720p → 1080p final</div>", unsafe_allow_html=True)
             if job.get("video_status") == "completed":
-                # Never auto-download the MP4 while rendering the page. That was
-                # the source of the long "Opening…"/frozen experience.
-                media_id = job.get("video_media_id") or ""
-                video_url = job.get("video_url") or job.get("drive_video_download_url") or ""
+                final_ready = video_1080_ready(job)
+                hd_status = str(job.get("video_hd_status") or "pending").lower()
+                final_media_id = job.get("video_media_id") if final_ready else ""
+                preview_media_id = final_media_id or job.get("video_source_media_id") or job.get("video_media_id") or ""
+                preview_url = (
+                    (job.get("video_url") if final_ready else job.get("video_source_url"))
+                    or (job.get("video_url") if not final_ready else "")
+                    or ""
+                )
                 cache_key = f"video_bytes_{job['id']}"
                 cached_data = st.session_state.get(cache_key)
 
-                # Resolve a playable signed URL once when Results is opened. This is
-                # lightweight (metadata only) and does not download the MP4 bytes.
-                auto_key = f"video_autoresolve_{job['id']}"
-                if not video_url and not cached_data and media_id and not st.session_state.get(auto_key):
-                    st.session_state[auto_key] = True
-                    resolved, _message = resolve_video_url(token, media_id)
-                    if resolved:
-                        video_url = resolved
-                        updated["video_url"] = resolved
-                        job["video_url"] = resolved
-                        st.session_state["jobs"][index] = updated
-
-                if video_url:
-                    st.video(video_url)
-                    st.link_button("↗ Open / download original MP4", video_url, use_container_width=True)
-                if job.get("drive_video_url"):
-                    st.link_button("☁ Open permanent Drive video", job.get("drive_video_url"), use_container_width=True)
-                elif cached_data:
-                    st.video(cached_data, format="video/mp4")
+                if final_ready:
+                    auto_key = f"video_autoresolve_{job['id']}"
+                    if not preview_url and not cached_data and final_media_id and not st.session_state.get(auto_key):
+                        st.session_state[auto_key] = True
+                        resolved, _message = resolve_video_url(token, final_media_id)
+                        if resolved:
+                            preview_url = resolved
+                            updated["video_url"] = resolved
+                            job["video_url"] = resolved
+                            st.session_state["jobs"][index] = updated
+                    st.success("✓ 1080p video ready")
+                elif hd_status == "failed":
+                    st.error(job.get("video_hd_error") or "The 720p video completed, but the 1080p upscale failed.")
                 else:
-                    st.success("Video generation completed.")
-                    st.caption("The MP4 exists in Flow. Use Refresh preview or Prepare download below if the signed preview link is still being prepared.")
+                    st.info(f"720p source complete · {video_display_status(job)}")
+                    st.caption("The app automatically upscales completed Omni clips to 1080p. Downloads and Drive archiving wait for the 1080p version.")
+
+                if preview_url:
+                    st.video(preview_url)
+                    if final_ready:
+                        st.link_button("↗ Open 1080p MP4", preview_url, use_container_width=True)
+                    else:
+                        st.caption("Previewing the native 720p source while the 1080p final is prepared.")
+                elif cached_data and final_ready:
+                    st.video(cached_data, format="video/mp4")
+
+                if final_ready and job.get("drive_video_url"):
+                    st.link_button("☁ Open permanent Drive video (1080p)", job.get("drive_video_url"), use_container_width=True)
 
                 a1, a2 = st.columns(2)
                 if a1.button(
-                    "↻ Refresh preview",
+                    "↻ Refresh status / preview",
                     key=f"resolve_vid_{job['id']}",
                     use_container_width=True,
-                    disabled=not bool(media_id),
+                    disabled=not bool(job.get("video_job_id") or job.get("video_upscale_job_id") or preview_media_id),
                 ):
-                    with st.spinner("Getting video link…"):
-                        resolved, message = resolve_video_url(token, media_id)
-                    if resolved:
-                        job["video_url"] = resolved
-                        st.session_state["jobs"][index] = job
-                        st.rerun()
-                    else:
-                        st.warning(message or "Video link is not ready yet.")
+                    with st.spinner("Checking Flow and the 1080p upscale…"):
+                        updated = refresh_one_video(updated, token)
+                        if video_1080_ready(updated) and updated.get("video_media_id") and not updated.get("video_url"):
+                            resolved, _message = resolve_video_url(token, updated.get("video_media_id"))
+                            if resolved:
+                                updated["video_url"] = resolved
+                    st.session_state["jobs"][index] = updated
+                    st.rerun()
 
-                if a2.button(
-                    "↓ Prepare download",
-                    key=f"prepare_vid_{job['id']}",
-                    use_container_width=True,
-                    disabled=not bool(media_id or job.get("drive_video_id") or video_url),
-                ):
-                    with st.spinner("Fetching MP4 from Flow or the permanent Drive archive…"):
-                        data = download_video_for_job(token, job)
-                    if data:
-                        st.session_state[cache_key] = data
+                if hd_status == "failed":
+                    if a2.button(
+                        "↻ Retry 1080p upscale",
+                        key=f"retry_hd_{job['id']}",
+                        use_container_width=True,
+                        disabled=not bool(job.get("video_source_media_id") or job.get("video_media_id")),
+                    ):
+                        updated["video_hd_status"] = "pending"
+                        updated["video_hd_error"] = None
+                        updated["video_upscale_job_id"] = None
+                        with st.spinner("Resubmitting free 1080p upscale…"):
+                            updated = refresh_one_video(updated, token)
+                        st.session_state["jobs"][index] = updated
                         st.rerun()
-                    else:
-                        st.warning("MP4 could not be retrieved yet.")
+                else:
+                    if a2.button(
+                        "↓ Prepare 1080p download",
+                        key=f"prepare_vid_{job['id']}",
+                        use_container_width=True,
+                        disabled=not final_ready,
+                    ):
+                        with st.spinner("Fetching the 1080p MP4 from Flow or the permanent Drive archive…"):
+                            data = download_video_for_job(token, job, require_1080=True)
+                        if data:
+                            st.session_state[cache_key] = data
+                            st.rerun()
+                        else:
+                            st.warning("The 1080p MP4 could not be retrieved yet.")
 
                 cached_data = st.session_state.get(cache_key)
-                if cached_data:
+                if cached_data and final_ready:
                     st.download_button(
-                        "↓ Download MP4",
+                        "↓ Download 1080p MP4",
                         data=cached_data,
-                        file_name=f"{safe_name(job.get('name'))}.mp4",
+                        file_name=f"{safe_name(job.get('name'))}_1080p.mp4",
                         mime="video/mp4",
                         key=f"dl_vid_{job['id']}",
                         use_container_width=True,
@@ -2384,12 +2575,12 @@ def render_job_result(job: dict, index: int, token: str, email: str, avatar_id: 
             elif job.get("video_status") == "failed":
                 st.error(job.get("video_error") or "Video generation failed")
             elif job.get("video_job_id"):
-                st.info(f"Omni job: {_status_label(job.get('video_status'))}")
+                st.info(f"Omni: {video_display_status(job)}")
             else:
                 st.info("Approve the image, then generate its video.")
 
             b1, b2 = st.columns(2)
-            active_video = bool(job.get("video_job_id")) and str(job.get("video_status") or "").lower() not in {"failed"}
+            active_video = video_pipeline_active(job) or video_1080_ready(job)
             if b1.button(
                 "▶ Generate video",
                 key=f"gen_vid_{job['id']}",
@@ -2543,350 +2734,71 @@ def render_flow_recovery(token: str, expanded: bool = False) -> None:
             cached_bytes = st.session_state.get(cache_bytes_key)
 
             if status == "completed":
+                hd_media_key = f"recovery_hd_media_{hashlib.sha1(chosen.encode()).hexdigest()[:12]}"
+                hd_url_key = f"recovery_hd_url_{hashlib.sha1(chosen.encode()).hexdigest()[:12]}"
+                hd_bytes_key = f"recovery_hd_bytes_{hashlib.sha1(chosen.encode()).hexdigest()[:12]}"
+                hd_media_id = str(st.session_state.get(hd_media_key) or "")
+                hd_url = str(st.session_state.get(hd_url_key) or "")
+                hd_bytes = st.session_state.get(hd_bytes_key)
+
+                # The recovered generation itself is normally the native 720p
+                # Omni asset. It is useful as a preview, but R13 never presents
+                # that source as the final downloadable deliverable.
                 if cached_url:
                     st.video(cached_url)
-                    st.link_button("Open original video", cached_url, use_container_width=True)
+                    st.caption("Native Omni source preview (720p). Final downloads are prepared at 1080p.")
                 elif cached_bytes:
                     st.video(cached_bytes, format="video/mp4")
+                    st.caption("Native Omni source preview (720p). Final downloads are prepared at 1080p.")
                 else:
-                    st.success("Video completed. Load its playable link or MP4 below.")
+                    st.success("Source video completed. Resolve the preview or prepare the 1080p final below.")
 
                 x1, x2 = st.columns(2)
-                if x1.button("Get playable link", use_container_width=True, disabled=not bool(media_id), key=f"recover_link_{chosen}"):
+                if x1.button("Get 720p preview link", use_container_width=True, disabled=not bool(media_id), key=f"recover_link_{chosen}"):
                     url, message = resolve_video_url(token, media_id)
                     if url:
                         st.session_state[cache_url_key] = url
                         st.rerun()
-                    st.warning(message or "The signed video link is not ready yet.")
-                if x2.button("Prepare MP4", use_container_width=True, disabled=not bool(media_id), key=f"recover_mp4_{chosen}"):
-                    data, message = download_video_raw(token, media_id)
-                    if data:
-                        st.session_state[cache_bytes_key] = data
+                    st.warning(message or "The signed preview link is not ready yet.")
+                if x2.button("Prepare recovered 1080p", type="primary", use_container_width=True, disabled=not bool(media_id) or bool(hd_media_id), key=f"recover_upscale_{chosen}"):
+                    try:
+                        with st.spinner("Upscaling recovered video to 1080p…"):
+                            hd = flow_upscale_video_1080_sync(token, media_id)
+                        st.session_state[hd_media_key] = hd["video_media_id"]
+                        if hd.get("video_url"):
+                            st.session_state[hd_url_key] = hd["video_url"]
                         st.rerun()
-                    st.warning(message or "The MP4 is not ready yet.")
+                    except Exception as exc:
+                        st.error(f"Could not prepare 1080p version: {exc}")
 
-                cached_bytes = st.session_state.get(cache_bytes_key)
-                if cached_bytes:
-                    st.download_button(
-                        "Download recovered MP4",
-                        data=cached_bytes,
-                        file_name=f"recovered_{safe_name(chosen[:28])}.mp4",
-                        mime="video/mp4",
-                        use_container_width=True,
-                        key=f"recover_dl_{chosen}",
-                    )
+                hd_media_id = str(st.session_state.get(hd_media_key) or "")
+                hd_url = str(st.session_state.get(hd_url_key) or "")
+                if hd_media_id:
+                    st.success("✓ Recovered video is ready in 1080p")
+                    if hd_url:
+                        st.video(hd_url)
+                        st.link_button("Open recovered 1080p MP4", hd_url, use_container_width=True)
+                    d1, d2 = st.columns(2)
+                    if d1.button("Prepare 1080p download", use_container_width=True, key=f"recover_mp4_{chosen}"):
+                        data, message = download_video_raw(token, hd_media_id)
+                        if data:
+                            st.session_state[hd_bytes_key] = data
+                            st.rerun()
+                        st.warning(message or "The 1080p MP4 is not ready yet.")
+                    hd_bytes = st.session_state.get(hd_bytes_key)
+                    if hd_bytes:
+                        d2.download_button(
+                            "Download recovered 1080p MP4",
+                            data=hd_bytes,
+                            file_name=f"recovered_{safe_name(chosen[:28])}_1080p.mp4",
+                            mime="video/mp4",
+                            use_container_width=True,
+                            key=f"recover_dl_{chosen}",
+                        )
             elif status == "failed":
                 st.error(str(payload.get("error") or payload.get("errorDetails") or "Video job failed."))
             else:
                 st.info("This job is still queued/processing. Press Check / refresh recovered jobs above to update it.")
-
-
-# R14_SCANNER_QUEUE_START
-SCANNER_QUEUE_TAB = "Scanner Queue"
-
-
-def _scanner_queue_open():
-    info = get_google_service_account_info()
-    sheet_ref = str(get_secret("GOOGLE_SHEET_URL") or "").strip()
-    if not info or not sheet_ref:
-        return None, None, "Google Sheets is not configured."
-
-    try:
-        import gspread
-    except Exception:
-        return None, None, "gspread is missing from requirements.txt."
-
-    try:
-        gc = gspread.service_account_from_dict(info)
-        if sheet_ref.startswith(("http://", "https://")):
-            book = gc.open_by_url(sheet_ref)
-        else:
-            book = gc.open_by_key(sheet_ref)
-        try:
-            ws = book.worksheet(SCANNER_QUEUE_TAB)
-        except gspread.WorksheetNotFound:
-            return None, gspread, ""
-        return ws, gspread, ""
-    except Exception as exc:
-        return None, gspread, str(exc)
-
-
-def _scanner_queue_pending():
-    ws, _gspread, error = _scanner_queue_open()
-    if error:
-        return [], ws, error
-    if ws is None:
-        return [], None, ""
-
-    try:
-        values = ws.get_all_values()
-    except Exception as exc:
-        return [], ws, str(exc)
-
-    if len(values) < 2:
-        return [], ws, ""
-
-    headers = values[0]
-    rows = []
-    for row_num, raw in enumerate(values[1:], start=2):
-        padded = raw + [""] * max(0, len(headers) - len(raw))
-        rec = dict(zip(headers, padded))
-        rec["_row_num"] = row_num
-
-        status = str(rec.get("Status") or "Pending").strip().lower()
-        link = str(rec.get("Product Link") or "").strip()
-        if status in {"", "pending", "queued"} and link:
-            rows.append(rec)
-
-    def _n(value):
-        try:
-            return int(float(str(value or "0").replace(",", "")))
-        except Exception:
-            return 0
-
-    rows.sort(
-        key=lambda r: (
-            _n(r.get("Creator Count")),
-            _n(r.get("Video Count")),
-            _n(r.get("Combined Views")),
-        ),
-        reverse=True,
-    )
-    return rows, ws, ""
-
-
-def _scanner_queue_mark_imported(ws, records, batch_id):
-    if ws is None or not records:
-        return
-
-    imported_at = _utc_now_iso()
-    for rec in records:
-        row_num = int(rec.get("_row_num") or 0)
-        if row_num < 2:
-            continue
-        ws.update(
-            range_name=f"J{row_num}:L{row_num}",
-            values=[["Imported", imported_at, batch_id]],
-            value_input_option="USER_ENTERED",
-        )
-
-
-def render_scanner_queue_import(
-    social_token: str,
-    region: str,
-    token: str,
-    auto_archive: bool,
-    drive_archive_cfg: dict,
-) -> None:
-    pending, ws, queue_error = _scanner_queue_pending()
-
-    if queue_error:
-        with st.expander("Import from Creator Scanner", expanded=False):
-            st.warning(f"Scanner Queue could not be read: {queue_error}")
-        return
-
-    pending_count = len(pending)
-    label = (
-        f"Import from Creator Scanner · {pending_count} waiting"
-        if pending_count
-        else "Import from Creator Scanner"
-    )
-
-    with st.expander(label, expanded=False):
-        st.markdown("<div class='panel-title'>Creator Scanner queue</div>", unsafe_allow_html=True)
-        st.markdown(
-            "<div class='panel-sub'>Select products already found by the Creator Scanner. "
-            "Flow Fashion will pull the full product details and photos with SociaVault.</div>",
-            unsafe_allow_html=True,
-        )
-
-        if not pending:
-            st.info("No pending products are waiting in Scanner Queue.")
-            return
-
-        current_jobs = list(st.session_state.get("jobs") or [])
-
-        behavior = st.radio(
-            "Scanner import behavior",
-            ["Add to current batch", "Start new batch"],
-            horizontal=True,
-            key="scanner_queue_behavior",
-        )
-
-        if behavior == "Add to current batch":
-            available = max(0, MAX_LINKS - len(current_jobs))
-            st.caption(
-                f"Current batch: {len(current_jobs)}/{MAX_LINKS} products · "
-                f"{available} slot(s) available."
-            )
-        else:
-            available = MAX_LINKS
-            st.caption(f"New batch capacity: {MAX_LINKS} products.")
-
-        table = [{
-            "Import": False,
-            "Product": rec.get("Product Name", ""),
-            "Creators": rec.get("Creators", ""),
-            "Creator Count": rec.get("Creator Count", ""),
-            "Video Count": rec.get("Video Count", ""),
-            "Views": rec.get("Combined Views", ""),
-            "Product Link": rec.get("Product Link", ""),
-        } for rec in pending]
-
-        edited = st.data_editor(
-            table,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Import": st.column_config.CheckboxColumn("Import", default=False),
-                "Product Link": st.column_config.LinkColumn("Product Link"),
-            },
-            disabled=[
-                "Product", "Creators", "Creator Count",
-                "Video Count", "Views", "Product Link",
-            ],
-            key="scanner_queue_main_editor",
-        )
-
-        selected_indexes = []
-        if hasattr(edited, "iterrows"):
-            for i, (_, row) in enumerate(edited.iterrows()):
-                if bool(row.get("Import")):
-                    selected_indexes.append(i)
-        elif isinstance(edited, list):
-            for i, row in enumerate(edited):
-                if isinstance(row, dict) and bool(row.get("Import")):
-                    selected_indexes.append(i)
-
-        if len(selected_indexes) > available:
-            st.warning(
-                f"You selected {len(selected_indexes)}, but only {available} slot(s) are available."
-            )
-
-        selected = [
-            pending[i]
-            for i in selected_indexes[:available]
-            if 0 <= i < len(pending)
-        ]
-
-        button_text = (
-            f"Add {len(selected)} selected to current batch"
-            if behavior == "Add to current batch"
-            else f"Start new batch with {len(selected)} selected"
-        )
-
-        if st.button(
-            button_text,
-            type="primary",
-            use_container_width=True,
-            key="scanner_queue_import_button",
-            disabled=(
-                not selected
-                or available <= 0
-                or len(selected_indexes) > available
-            ),
-        ):
-            imported = []
-            successful_queue_rows = []
-            errors = []
-
-            progress = st.progress(
-                0,
-                text="Importing Scanner products with SociaVault…",
-            )
-
-            with ThreadPoolExecutor(
-                max_workers=min(IMPORT_WORKERS, len(selected))
-            ) as ex:
-                future_map = {
-                    ex.submit(
-                        import_product,
-                        str(rec.get("Product Link") or "").strip(),
-                        social_token,
-                        region,
-                    ): rec
-                    for rec in selected
-                }
-
-                done = 0
-                for fut in as_completed(future_map):
-                    rec = future_map[fut]
-                    try:
-                        imported.append(fut.result())
-                        successful_queue_rows.append(rec)
-                    except Exception as exc:
-                        errors.append((rec, str(exc)))
-
-                    done += 1
-                    progress.progress(
-                        done / len(selected),
-                        text=f"Imported {done}/{len(selected)}",
-                    )
-
-            if behavior == "Add to current batch":
-                existing_urls = {
-                    str(j.get("url") or "").strip()
-                    for j in current_jobs
-                    if str(j.get("url") or "").strip()
-                }
-                additions = [
-                    j for j in imported
-                    if str(j.get("url") or "").strip() not in existing_urls
-                ]
-                new_jobs = current_jobs + additions
-                batch_id, _ = ensure_batch_metadata(new_jobs)
-            else:
-                new_jobs = imported[:MAX_LINKS]
-                batch_id, _ = ensure_batch_metadata(
-                    new_jobs,
-                    force_new=True,
-                )
-
-            if auto_archive and drive_archive_cfg.get("configured") and new_jobs:
-                with st.spinner(
-                    "Archiving selected product references to Drive…"
-                ):
-                    new_jobs, _ = archive_completed_jobs(
-                        new_jobs,
-                        token,
-                    )
-
-            st.session_state["jobs"] = new_jobs
-            st.session_state.pop("batch_history_cache", None)
-            st.session_state.pop("videos_zip", None)
-            st.session_state.pop("full_batch_zip", None)
-
-            if successful_queue_rows:
-                try:
-                    _scanner_queue_mark_imported(
-                        ws,
-                        successful_queue_rows,
-                        batch_id,
-                    )
-                except Exception as exc:
-                    st.session_state["scanner_queue_warning"] = (
-                        "Products imported, but queue status could not be "
-                        f"updated: {exc}"
-                    )
-
-            if errors:
-                st.session_state["scanner_queue_errors"] = [
-                    (
-                        str(
-                            rec.get("Product Name")
-                            or rec.get("Product Link")
-                            or "Product"
-                        ),
-                        err,
-                    )
-                    for rec, err in errors
-                ]
-
-            st.session_state["scanner_queue_success"] = (
-                f"Imported {len(imported)} Scanner product(s) into Flow Fashion."
-            )
-            st.rerun()
-# R14_SCANNER_QUEUE_END
 
 
 def main():
@@ -2962,8 +2874,22 @@ def main():
 
         st.markdown("<div class='section-label'>BATCH SETTINGS</div>", unsafe_allow_html=True)
         run_mode = st.radio("Pipeline", ["Review images first", "Full auto"])
+        creator_profile = st.selectbox(
+            "Avatar prompt profile",
+            ["Male", "Female"],
+            index=0 if str(st.session_state.get("creator_profile") or "Male") != "Female" else 1,
+            key="creator_profile",
+            help="Selects the male/female movement vocabulary from the AI Shop Academy prompt framework. The uploaded avatar remains the identity reference.",
+        )
+        video_style = st.selectbox(
+            "Video movement style",
+            ["Calm / premium", "High-energy", "Flashy / flash-lit"],
+            index=["Calm / premium", "High-energy", "Flashy / flash-lit"].index(str(st.session_state.get("video_style") or "Calm / premium")) if str(st.session_state.get("video_style") or "Calm / premium") in ["Calm / premium", "High-energy", "Flashy / flash-lit"] else 0,
+            key="video_style",
+            help="Calm is the recommended default. Product-specific shoe/handbag/back-fit movements override the generic style where needed.",
+        )
         scene = st.selectbox("Mirror setting", list(SCENES.keys()), index=0)
-        st.caption("Nano Banana 2 · 9:16\n\nOmni 1.1 Flash · 8s · 720p")
+        st.caption("Nano Banana Pro · 9:16 · face fully blocked by phone\n\nOmni 1.1 Flash · 8s · native 720p → automatic 1080p upscale")
         auto_archive = st.checkbox(
             "Auto-archive completed media to Drive",
             value=bool(drive_archive_cfg.get("auto")),
@@ -3016,8 +2942,9 @@ def main():
           <p class='app-subtitle'>Import TikTok Shop clothing, choose the exact reference photos, generate the stills, approve what you like, then turn them into short motion clips.</p>
           <div class='top-pills'>
             <span class='top-pill'>SociaVault import</span>
-            <span class='top-pill'>Nano Banana 2</span>
+            <span class='top-pill'>Nano Banana Pro</span>
             <span class='top-pill'>Omni 1.1 Flash</span>
+            <span class='top-pill'>1080p final downloads</span>
             <span class='top-pill'>Up to 10 products</span>
           </div>
         </div>
@@ -3038,111 +2965,28 @@ def main():
     # Recovery must stay visible even when there is no imported product batch.
     render_flow_recovery(token, expanded=not bool(st.session_state.get("jobs")))
 
-
-
-    if st.session_state.get("scanner_queue_success"):
-        st.success(st.session_state.pop("scanner_queue_success"))
-    if st.session_state.get("scanner_queue_warning"):
-        st.warning(st.session_state.pop("scanner_queue_warning"))
-    if st.session_state.get("scanner_queue_errors"):
-        for _name, _error in st.session_state.pop("scanner_queue_errors"):
-            st.warning(f"Could not import {_name} — {_error}")
-
-    render_scanner_queue_import(
-        social_token=social_token,
-        region=region,
-        token=token,
-        auto_archive=auto_archive,
-        drive_archive_cfg=drive_archive_cfg,
-    )
-    # ---------------- Import products ----------------
+    # ---------------- Import / replace batch ----------------
     jobs = st.session_state.get("jobs") or []
-    with st.expander(
-        "Import products" if not jobs else "Add products or start a new batch",
-        expanded=not bool(jobs),
-    ):
+    with st.expander("Import products" if not jobs else "Import or replace batch", expanded=not bool(jobs)):
         st.markdown("<div class='panel-title'>TikTok Shop products</div>", unsafe_allow_html=True)
-
-        import_behavior = "Start new batch"
-        available_slots = MAX_LINKS
-
-        if jobs:
-            import_behavior = st.radio(
-                "Import behavior",
-                ["Add to current batch", "Start new batch"],
-                horizontal=True,
-                key="product_import_behavior",
-                help=(
-                    "Add to current batch keeps the products already open and adds new "
-                    "ones after them. Start new batch replaces only the current workspace; "
-                    "older rows in the Google Sheet tracker are still preserved."
-                ),
-            )
-            if import_behavior == "Add to current batch":
-                available_slots = max(0, MAX_LINKS - len(jobs))
-                st.caption(
-                    f"Current batch: {len(jobs)}/{MAX_LINKS} products · "
-                    f"{available_slots} slot(s) available."
-                )
-            else:
-                available_slots = MAX_LINKS
-        else:
-            st.markdown(
-                "<div class='panel-sub'>Paste one product URL per line. "
-                "The first 10 valid links are used.</div>",
-                unsafe_allow_html=True,
-            )
-
+        st.markdown("<div class='panel-sub'>Paste one product URL per line. The first 10 valid links are used.</div>", unsafe_allow_html=True)
         raw_links = st.text_area(
             "TikTok Shop links",
             height=145,
-            placeholder=(
-                "https://www.tiktok.com/shop/pdp/...\n"
-                "https://www.tiktok.com/shop/pdp/..."
-            ),
+            placeholder="https://www.tiktok.com/shop/pdp/...\nhttps://www.tiktok.com/shop/pdp/...",
             label_visibility="collapsed",
         )
-
         raw_count = len([x for x in raw_links.splitlines() if x.strip()])
-        cleaned_links = dedupe(
-            [
-                x.strip()
-                for x in raw_links.splitlines()
-                if x.strip() and not x.strip().startswith("#")
-            ]
-        )
-        links = cleaned_links[:available_slots]
+        links = dedupe([x.strip() for x in raw_links.splitlines() if x.strip() and not x.strip().startswith("#")])[:MAX_LINKS]
+        if raw_count > MAX_LINKS:
+            st.warning(f"Only the first {MAX_LINKS} links will be processed.")
 
-        if raw_count > available_slots:
-            if jobs and import_behavior == "Add to current batch":
-                st.warning(
-                    f"This batch has room for {available_slots} more product(s). "
-                    "Extra links will not be imported."
-                )
-            else:
-                st.warning(f"Only the first {MAX_LINKS} links will be processed.")
-
-        import_disabled = not bool(links) or available_slots <= 0
-
-        if st.button(
-            "Add products with SociaVault"
-            if jobs and import_behavior == "Add to current batch"
-            else "Import products with SociaVault",
-            type="primary",
-            use_container_width=True,
-            disabled=import_disabled,
-        ):
+        if st.button("Import products with SociaVault", type="primary", use_container_width=True, disabled=not bool(links)):
             imported = []
             errors = []
             progress = st.progress(0, text="Importing products...")
-
-            with ThreadPoolExecutor(
-                max_workers=min(IMPORT_WORKERS, len(links))
-            ) as ex:
-                future_map = {
-                    ex.submit(import_product, link, social_token, region): link
-                    for link in links
-                }
+            with ThreadPoolExecutor(max_workers=min(IMPORT_WORKERS, len(links))) as ex:
+                future_map = {ex.submit(import_product, link, social_token, region): link for link in links}
                 done = 0
                 for fut in as_completed(future_map):
                     link = future_map[fut]
@@ -3151,47 +2995,19 @@ def main():
                     except Exception as exc:
                         errors.append((link, str(exc)))
                     done += 1
-                    progress.progress(
-                        done / len(links),
-                        text=f"Imported {done}/{len(links)}",
-                    )
-
+                    progress.progress(done / len(links), text=f"Imported {done}/{len(links)}")
             by_url = {j["url"]: j for j in imported}
-            imported_in_input_order = [
-                by_url[x] for x in links if x in by_url
-            ]
-
-            if jobs and import_behavior == "Add to current batch":
-                existing_urls = {
-                    str(j.get("url") or "").strip()
-                    for j in jobs
-                    if str(j.get("url") or "").strip()
-                }
-                additions = [
-                    j
-                    for j in imported_in_input_order
-                    if str(j.get("url") or "").strip() not in existing_urls
-                ]
-                new_jobs = list(jobs) + additions
-
-                # Keep current batch identity and existing Sheet row assignments.
-                ensure_batch_metadata(new_jobs)
-            else:
-                new_jobs = imported_in_input_order
-                ensure_batch_metadata(new_jobs, force_new=True)
-
+            new_jobs = [by_url[x] for x in links if x in by_url]
+            ensure_batch_metadata(new_jobs, force_new=True)
             if auto_archive and drive_archive_cfg.get("configured") and new_jobs:
                 with st.spinner("Archiving selected product references to Drive…"):
                     new_jobs, _ = archive_completed_jobs(new_jobs, token)
-
             st.session_state["jobs"] = new_jobs
             st.session_state.pop("batch_history_cache", None)
             st.session_state.pop("videos_zip", None)
             st.session_state.pop("full_batch_zip", None)
-
             if errors:
                 st.session_state["import_errors"] = errors
-
             st.rerun()
 
     if st.session_state.get("import_errors"):
@@ -3221,12 +3037,18 @@ def main():
         return
 
     ensure_batch_metadata(jobs)
+    # Apply the selected Academy prompt profile/style to this working batch.
+    # This is done on the main Streamlit thread before image workers are launched.
+    for _job in jobs:
+        _job["creator_profile"] = creator_profile
+        _job["video_style"] = video_style
+    st.session_state["jobs"] = jobs
     # On the rerun after any generation/status change, persist the new state automatically.
     maybe_sync_batch(jobs, default_google_sheet_url, sync_current_tab=auto_sheet_sync)
 
     completed_images = sum(1 for j in jobs if j.get("image_status") == "completed")
     approved = sum(1 for j in jobs if j.get("approved"))
-    completed_videos = sum(1 for j in jobs if j.get("video_status") == "completed")
+    completed_videos = sum(1 for j in jobs if video_1080_ready(j))
 
     tabs = st.tabs(["Products", "Generate", "Results", "History"])
 
@@ -3329,7 +3151,12 @@ def main():
                     for j in jobs
                 ),
             )
-            failed_generation = any(str(j.get("image_status") or "").lower() == "failed" or str(j.get("video_status") or "").lower() == "failed" for j in jobs)
+            failed_generation = any(
+                str(j.get("image_status") or "").lower() == "failed"
+                or str(j.get("video_status") or "").lower() == "failed"
+                or str(j.get("video_hd_status") or "").lower() == "failed"
+                for j in jobs
+            )
             failed_images_need_avatar = any(str(j.get("image_status") or "").lower() == "failed" for j in jobs)
             retry_failed = st.button(
                 f"↻ Retry failed only ({failed_count})",
@@ -3356,6 +3183,18 @@ def main():
                             jobs[idx]["approved"] = True
                         done += 1
                         progress.progress(done / max(1, len(failed_image_indices)), text=f"Retried images {done}/{len(failed_image_indices)}")
+            hd_retry_indices = [
+                i for i, j in enumerate(jobs)
+                if str(j.get("video_status") or "").lower() == "completed"
+                and str(j.get("video_hd_status") or "").lower() == "failed"
+                and (j.get("video_source_media_id") or j.get("video_media_id"))
+            ]
+            for idx in hd_retry_indices:
+                jobs[idx]["video_hd_status"] = "pending"
+                jobs[idx]["video_hd_error"] = None
+                jobs[idx]["video_upscale_job_id"] = None
+                jobs[idx] = refresh_one_video(jobs[idx], token)
+
             video_retry_indices = [
                 i for i, j in enumerate(jobs)
                 if str(j.get("video_status") or "").lower() == "failed"
@@ -3376,7 +3215,7 @@ def main():
             st.session_state["jobs"] = jobs
             remember_video_job_ids(jobs)
             maybe_sync_batch(jobs, default_google_sheet_url, sync_current_tab=auto_sheet_sync, force=True)
-            st.session_state["retry_notice"] = f"Retried failed items only · {len(video_retry_indices)} video submission(s)."
+            st.session_state["retry_notice"] = f"Retried failed items only · {len(video_retry_indices)} video generation(s) + {len(hd_retry_indices)} 1080p upscale(s)."
             st.rerun()
 
         if generate_images or run_full:
@@ -3389,7 +3228,7 @@ def main():
                         st.stop()
             avatar_id = st.session_state["avatar_flow_id"]
             indices = [i for i, j in enumerate(jobs) if j.get("selected_refs")]
-            progress = st.progress(0, text="Generating Nano Banana 2 images...")
+            progress = st.progress(0, text="Generating Nano Banana Pro images...")
             updates = {}
             with ThreadPoolExecutor(max_workers=min(IMAGE_WORKERS, len(indices) or 1)) as ex:
                 futures = {ex.submit(generate_one_image, jobs[i], token, flow_email, avatar_id, scene): i for i in indices}
@@ -3457,19 +3296,13 @@ def main():
 
         # Non-blocking live monitor. Streamlit reruns only this small fragment every 12s
         # while any Omni job is active, instead of freezing the whole page for up to 10 minutes.
-        _has_pending_video = any(
-            j.get("video_job_id") and str(j.get("video_status") or "").lower() not in {"completed", "failed"}
-            for j in st.session_state.get("jobs", [])
-        )
+        _has_pending_video = any(video_pipeline_active(j) for j in st.session_state.get("jobs", []))
         _video_poll_every = 12 if _has_pending_video else None
 
         @st.fragment(run_every=_video_poll_every)
         def _live_omni_monitor():
             current = [dict(j) for j in st.session_state.get("jobs", [])]
-            pending = [
-                i for i, j in enumerate(current)
-                if j.get("video_job_id") and str(j.get("video_status") or "").lower() not in {"completed", "failed"}
-            ]
+            pending = [i for i, j in enumerate(current) if video_pipeline_active(j)]
             if not pending:
                 return
 
@@ -3478,7 +3311,7 @@ def main():
             if auto_archive and drive_archive_cfg.get("configured"):
                 newly_complete = any(
                     (j.get("image_status") == "completed" and not j.get("drive_image_id"))
-                    or (j.get("video_status") == "completed" and not j.get("drive_video_id"))
+                    or (video_1080_ready(j) and not j.get("drive_video_id"))
                     for j in current
                 )
                 if newly_complete:
@@ -3496,17 +3329,17 @@ def main():
                 active_rows.append({
                     "#": idx,
                     "Product": _short_title(j.get("name"), 46),
-                    "Omni status": _status_label(j.get("video_status")),
+                    "Omni status": video_display_status(j),
                     "Elapsed": f"{elapsed}s" if elapsed is not None else "—",
-                    "Error": j.get("video_error") or "",
+                    "Error": j.get("video_hd_error") or j.get("video_error") or "",
                 })
 
-            ready = sum(1 for j in current if str(j.get("video_status") or "").lower() == "completed")
-            failed = sum(1 for j in current if str(j.get("video_status") or "").lower() == "failed")
-            still = sum(1 for j in current if j.get("video_job_id") and str(j.get("video_status") or "").lower() not in {"completed", "failed"})
+            ready = sum(1 for j in current if video_1080_ready(j))
+            failed = sum(1 for j in current if _dashboard_stage(j) == "Failed")
+            still = sum(1 for j in current if video_pipeline_active(j))
 
             st.markdown("<div class='panel-title'>Live Omni 1.1 status</div>", unsafe_allow_html=True)
-            st.caption(f"{ready} ready · {still} processing/queued · {failed} failed · auto-checks every 12 seconds")
+            st.caption(f"{ready} ready in 1080p · {still} generating/upscaling · {failed} failed · auto-checks every 12 seconds")
             if active_rows:
                 st.dataframe(active_rows, use_container_width=True, hide_index=True)
 
@@ -3529,11 +3362,15 @@ def main():
                 "Stage": stage,
                 "Image": _status_label(job.get("image_status")),
                 "Approved": "Yes" if job.get("approved") else "No",
-                "Video": _status_label(job.get("video_status")),
-                "Drive": "Archived" if job.get("drive_image_id") and (job.get("video_status") != "completed" or job.get("drive_video_id")) else "Pending",
+                "Video": video_display_status(job),
+                "Drive": (
+                    "Archived" if job.get("drive_image_id") and (not job.get("video_job_id") or (video_1080_ready(job) and job.get("drive_video_id")))
+                    else "Partial" if job.get("drive_image_id")
+                    else "Pending"
+                ),
                 "Calls": f"{image_calls} img / {video_calls} vid",
                 "Retries": retries,
-                "Error": job.get("video_error") or job.get("image_error") or "",
+                "Error": job.get("video_hd_error") or job.get("video_error") or job.get("image_error") or "",
             })
         st.dataframe(status_rows, use_container_width=True, hide_index=True)
 
@@ -3558,7 +3395,7 @@ def main():
         jobs[result_index] = updated
         if auto_archive and drive_archive_cfg.get("configured") and (
             (updated.get("image_status") == "completed" and not updated.get("drive_image_id"))
-            or (updated.get("video_status") == "completed" and not updated.get("drive_video_id"))
+            or (video_1080_ready(updated) and not updated.get("drive_video_id"))
         ):
             jobs, _ = archive_completed_jobs(jobs, token)
         st.session_state["jobs"] = jobs
@@ -3620,16 +3457,16 @@ def main():
             total_refs = sum(len(j.get("selected_refs") or []) for j in jobs)
             archived_images = sum(1 for j in jobs if j.get("drive_image_id"))
             archived_videos = sum(1 for j in jobs if j.get("drive_video_id"))
-            completed_media = sum(1 for j in jobs if j.get("image_status") == "completed") + sum(1 for j in jobs if j.get("video_status") == "completed")
+            completed_media = sum(1 for j in jobs if j.get("image_status") == "completed") + sum(1 for j in jobs if video_1080_ready(j))
             archivable_total = total_refs + completed_media
             archived_media = archived_refs + archived_images + archived_videos
             d1, d2, d3, d4 = st.columns([1, 1, 1, 2])
             d1.metric("References", f"{archived_refs}/{total_refs}")
             d2.metric("Drive images", archived_images)
             d3.metric("Drive videos", archived_videos)
-            folder_url = next((j.get("drive_batch_folder_url") for j in jobs if j.get("drive_batch_folder_url")), "")
+            folder_url = next((j.get("drive_product_folder_url") or j.get("drive_batch_folder_url") for j in jobs if j.get("drive_product_folder_url") or j.get("drive_batch_folder_url")), "")
             if folder_url:
-                d4.link_button("Open this batch folder in Google Drive", folder_url, use_container_width=True)
+                d4.link_button("Open first product folder in Google Drive", folder_url, use_container_width=True)
             elif drive_archive_cfg.get("configured"):
                 d4.caption(f"{archived_media}/{archivable_total} reference/generated files archived")
             else:
@@ -3669,7 +3506,7 @@ def main():
             )
             tab_name = gs2.text_input("Worksheet/tab", value="Flow Try-On", key="google_sheet_tab")
             gs3, gs4 = st.columns([1, 2])
-            push_mode = gs3.selectbox("Push mode", ["Append rows", "Replace tab"], key="google_sheet_mode")
+            push_mode = gs3.selectbox("Push mode", ["Replace tab", "Append rows"], key="google_sheet_mode")
             service_info = get_google_service_account_info()
             if service_info and service_info.get("client_email"):
                 gs4.caption(f"Share the Sheet with: {service_info.get('client_email')} · Editor")

@@ -9,7 +9,7 @@ Standalone Streamlit bulk try-on pipeline.
 3. SociaVault imports listing + review images.
 4. Avatar is uploaded to Google Flow once and is always `reference_1`.
 5. Product photos are uploaded as later references.
-6. Google Flow `nano-banana-2` generates one 9:16 try-on image per product.
+6. Google Flow `nano-banana-pro` generates one 9:16 try-on image per product.
 7. In Review mode, approve/regenerate images before video. In Full Auto, completed images automatically continue.
 8. Google Flow `omni-flash` (Omni 1.1 Flash) generates 8-second 720p portrait video using the generated try-on image as `startImage`.
 9. Refresh all video jobs, preview results, and download ZIPs.
